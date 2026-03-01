@@ -21,8 +21,95 @@ function getAliasPaths(config, repoAlias) {
     metadataPath: path.join(aliasDir, 'metadata.json'),
     privateKeyPath: path.join(sshDir, 'id_ed25519'),
     publicKeyPath: path.join(sshDir, 'id_ed25519.pub'),
+    uiStatePath: path.join(aliasDir, 'ui-state.json'),
     sshDir,
   };
+}
+
+function compareTreeNodes(left, right) {
+  if (left.type !== right.type) {
+    return left.type === 'directory' ? -1 : 1;
+  }
+
+  return left.name.localeCompare(right.name);
+}
+
+function mergeEphemeralDirectories(tree, ephemeralDirectories) {
+  for (const directoryPath of ephemeralDirectories) {
+    const segments = directoryPath.split('/').filter(Boolean);
+    let currentNode = tree;
+    let currentPath = '';
+
+    for (const segment of segments) {
+      const nextPath = currentPath ? `${currentPath}/${segment}` : segment;
+      let childNode = (currentNode.children ?? []).find(
+        (child) => child.type === 'directory' && child.name === segment,
+      );
+
+      if (!childNode) {
+        childNode = {
+          type: 'directory',
+          name: segment,
+          path: nextPath,
+          children: [],
+        };
+        currentNode.children = [...(currentNode.children ?? []), childNode].sort(compareTreeNodes);
+      }
+
+      currentNode = childNode;
+      currentPath = nextPath;
+    }
+  }
+
+  return tree;
+}
+
+function findTreeNode(node, targetPath) {
+  if (!node) {
+    return null;
+  }
+
+  if (node.path === targetPath) {
+    return node;
+  }
+
+  for (const child of node.children ?? []) {
+    const match = findTreeNode(child, targetPath);
+
+    if (match) {
+      return match;
+    }
+  }
+
+  return null;
+}
+
+function hasFileDescendant(node) {
+  if (!node) {
+    return false;
+  }
+
+  if (node.type === 'file') {
+    return true;
+  }
+
+  return (node.children ?? []).some((child) => hasFileDescendant(child));
+}
+
+function collectDirectoryPaths(node, paths = new Set()) {
+  if (!node || node.type !== 'directory') {
+    return paths;
+  }
+
+  if (node.path) {
+    paths.add(node.path);
+  }
+
+  for (const child of node.children ?? []) {
+    collectDirectoryPaths(child, paths);
+  }
+
+  return paths;
 }
 
 function buildRepoConfig(appConfig, metadata) {
@@ -111,6 +198,7 @@ export class RepoManager {
     };
 
     await fs.writeFile(aliasPaths.metadataPath, `${JSON.stringify(metadata, null, 2)}\n`, 'utf8');
+    await this.#writeUiState(normalizedAlias, { ephemeralDirectories: [] });
 
     return {
       created: true,
@@ -130,13 +218,74 @@ export class RepoManager {
     }
   }
 
+  async getRepoAliasDetails(repoAlias) {
+    const metadata = await this.#readMetadata(this.#normalizeRepoAlias(repoAlias));
+
+    return {
+      repo: metadata.repo,
+      repoAlias: metadata.repoAlias,
+    };
+  }
+
+  async updateRepoAlias(repoAlias, repo) {
+    const normalizedAlias = this.#normalizeRepoAlias(repoAlias);
+    const normalizedRepo = this.#normalizeRepo(repo);
+    const metadata = await this.#readMetadata(normalizedAlias);
+    const aliasPaths = getAliasPaths(this.config, normalizedAlias);
+
+    if (metadata.repo === normalizedRepo) {
+      return {
+        repo: metadata.repo,
+        repoAlias: metadata.repoAlias,
+        updated: false,
+      };
+    }
+
+    const nextMetadata = {
+      ...metadata,
+      repo: normalizedRepo,
+      updatedAt: new Date().toISOString(),
+    };
+
+    await fs.writeFile(aliasPaths.metadataPath, `${JSON.stringify(nextMetadata, null, 2)}\n`, 'utf8');
+    this.services.delete(normalizedAlias);
+
+    return {
+      repo: normalizedRepo,
+      repoAlias: normalizedAlias,
+      updated: true,
+    };
+  }
+
+  async deleteRepoAlias(repoAlias) {
+    const normalizedAlias = this.#normalizeRepoAlias(repoAlias);
+    const metadata = await this.#readMetadata(normalizedAlias);
+    const aliasPaths = getAliasPaths(this.config, normalizedAlias);
+    const service = this.services.get(normalizedAlias);
+
+    if (service) {
+      await service.dispose();
+      this.services.delete(normalizedAlias);
+    }
+
+    await fs.rm(aliasPaths.aliasDir, { recursive: true, force: true });
+
+    return {
+      deleted: true,
+      repo: metadata.repo,
+      repoAlias: metadata.repoAlias,
+    };
+  }
+
   async getState(repoAlias) {
     try {
-      const service = await this.#ensureServiceReady(repoAlias, 'bootstrap');
+      const normalizedAlias = this.#normalizeRepoAlias(repoAlias);
+      const service = await this.#ensureServiceReady(normalizedAlias, 'bootstrap');
 
       return {
         ready: true,
-        ...(await service.getState()),
+        status: service.getStatus(),
+        tree: await this.#listTreeWithUiState(normalizedAlias, service),
       };
     } catch (error) {
       return {
@@ -158,9 +307,104 @@ export class RepoManager {
   }
 
   async createFile(repoAlias, relativePath) {
-    const service = await this.#ensureServiceReady(repoAlias, 'create file');
+    const normalizedAlias = this.#normalizeRepoAlias(repoAlias);
+    const service = await this.#ensureServiceReady(normalizedAlias, 'create file');
     await service.createFile(relativePath);
-    return service.getStatus();
+    return {
+      status: service.getStatus(),
+      tree: await this.#listTreeWithUiState(normalizedAlias, service),
+    };
+  }
+
+  async createFolder(repoAlias, parentPath, name) {
+    const normalizedAlias = this.#normalizeRepoAlias(repoAlias);
+    const normalizedParentPath = this.#normalizeDirectoryPath(parentPath);
+    const normalizedName = this.#normalizeEntryName(name, 'Folder name');
+    const nextDirectoryPath = normalizedParentPath
+      ? `${normalizedParentPath}/${normalizedName}`
+      : normalizedName;
+    const service = await this.#ensureServiceReady(normalizedAlias, 'create folder');
+    const tree = await this.#listTreeWithUiState(normalizedAlias, service);
+
+    if (normalizedParentPath && !this.#hasDirectoryPath(tree, normalizedParentPath)) {
+      throw new Error(`Directory "${normalizedParentPath}" does not exist.`);
+    }
+
+    if (this.#hasDirectoryPath(tree, nextDirectoryPath)) {
+      throw new Error(`Directory "${nextDirectoryPath}" already exists.`);
+    }
+
+    const uiState = await this.#readUiState(normalizedAlias);
+    const nextUiState = {
+      ephemeralDirectories: [...new Set([...uiState.ephemeralDirectories, nextDirectoryPath])].sort(),
+    };
+
+    await this.#writeUiState(normalizedAlias, nextUiState);
+
+    return {
+      path: nextDirectoryPath,
+      status: service.getStatus(),
+      tree: await this.#listTreeWithUiState(normalizedAlias, service),
+    };
+  }
+
+  async deleteFolder(repoAlias, folderPath) {
+    const normalizedAlias = this.#normalizeRepoAlias(repoAlias);
+    const normalizedFolderPath = this.#normalizeDirectoryPath(folderPath);
+
+    if (!normalizedFolderPath) {
+      throw new Error('Folder path is required.');
+    }
+
+    const service = await this.#ensureServiceReady(normalizedAlias, 'delete folder');
+    const tree = await this.#listTreeWithUiState(normalizedAlias, service);
+    const folderNode = findTreeNode(tree, normalizedFolderPath);
+
+    if (!folderNode || folderNode.type !== 'directory') {
+      throw new Error(`Directory "${normalizedFolderPath}" does not exist.`);
+    }
+
+    if (hasFileDescendant(folderNode)) {
+      throw new Error(`Directory "${normalizedFolderPath}" cannot be deleted because it contains files.`);
+    }
+
+    const absoluteFolderPath = path.join(service.config.repoDir, normalizedFolderPath);
+    await fs.rm(absoluteFolderPath, { recursive: true, force: true });
+
+    const uiState = await this.#readUiState(normalizedAlias);
+    const nextUiState = {
+      ephemeralDirectories: uiState.ephemeralDirectories.filter(
+        (entry) => entry !== normalizedFolderPath && !entry.startsWith(`${normalizedFolderPath}/`),
+      ),
+    };
+
+    await this.#writeUiState(normalizedAlias, nextUiState);
+
+    return {
+      deleted: true,
+      path: normalizedFolderPath,
+      status: service.getStatus(),
+      tree: await this.#listTreeWithUiState(normalizedAlias, service),
+    };
+  }
+
+  async refreshTree(repoAlias) {
+    const normalizedAlias = this.#normalizeRepoAlias(repoAlias);
+    const service = await this.#ensureServiceReady(normalizedAlias, 'refresh tree');
+    await service.ensureFreshClone('manual refresh');
+    const actualTree = await service.listTree();
+    const actualDirectoryPaths = collectDirectoryPaths(actualTree);
+    const uiState = await this.#readUiState(normalizedAlias);
+    const nextUiState = {
+      ephemeralDirectories: uiState.ephemeralDirectories.filter((entry) => actualDirectoryPaths.has(entry)),
+    };
+
+    await this.#writeUiState(normalizedAlias, nextUiState);
+
+    return {
+      status: service.getStatus(),
+      tree: mergeEphemeralDirectories(actualTree, nextUiState.ephemeralDirectories),
+    };
   }
 
   async syncNow(repoAlias, reason = 'manual') {
@@ -173,7 +417,7 @@ export class RepoManager {
     return {
       result,
       status: service.getStatus(),
-      tree: await service.listTree(),
+      tree: await this.#listTreeWithUiState(this.#normalizeRepoAlias(repoAlias), service),
     };
   }
 
@@ -242,6 +486,52 @@ export class RepoManager {
     }
 
     return metadata;
+  }
+
+  async #readUiState(repoAlias) {
+    let rawUiState;
+
+    try {
+      rawUiState = await fs.readFile(getAliasPaths(this.config, repoAlias).uiStatePath, 'utf8');
+    } catch (error) {
+      if (error.code === 'ENOENT') {
+        return { ephemeralDirectories: [] };
+      }
+
+      throw error;
+    }
+
+    try {
+      const parsed = JSON.parse(rawUiState);
+      const ephemeralDirectories = Array.isArray(parsed.ephemeralDirectories)
+        ? parsed.ephemeralDirectories
+            .filter((entry) => typeof entry === 'string')
+            .map((entry) => this.#normalizeDirectoryPath(entry))
+            .filter(Boolean)
+        : [];
+
+      return {
+        ephemeralDirectories: [...new Set(ephemeralDirectories)].sort(),
+      };
+    } catch (error) {
+      throw new Error(`UI state for repo alias "${repoAlias}" is invalid: ${error.message}`);
+    }
+  }
+
+  async #writeUiState(repoAlias, uiState) {
+    const aliasPaths = getAliasPaths(this.config, repoAlias);
+    await fs.writeFile(aliasPaths.uiStatePath, `${JSON.stringify(uiState, null, 2)}\n`, 'utf8');
+  }
+
+  async #listTreeWithUiState(repoAlias, service) {
+    const tree = await service.listTree();
+    const uiState = await this.#readUiState(repoAlias);
+    return mergeEphemeralDirectories(tree, uiState.ephemeralDirectories);
+  }
+
+  #hasDirectoryPath(node, targetPath) {
+    const match = findTreeNode(node, targetPath);
+    return match?.type === 'directory';
   }
 
   async #generateKeyPair(privateKeyPath, repoAlias) {
@@ -326,5 +616,47 @@ export class RepoManager {
     }
 
     return normalizedRepo;
+  }
+
+  #normalizeDirectoryPath(relativePath) {
+    const trimmedPath = typeof relativePath === 'string' ? relativePath.trim() : '';
+
+    if (trimmedPath === '') {
+      return '';
+    }
+
+    const normalizedPath = path.posix
+      .normalize(trimmedPath.replace(/\\/g, '/').replace(/^\/+/, ''))
+      .replace(/\/+$/, '');
+
+    if (
+      normalizedPath === '' ||
+      normalizedPath === '.' ||
+      normalizedPath === '..' ||
+      normalizedPath.startsWith('../') ||
+      normalizedPath.includes('/../') ||
+      normalizedPath === '.git' ||
+      normalizedPath.startsWith('.git/')
+    ) {
+      throw new Error(`Invalid directory path: ${relativePath}`);
+    }
+
+    return normalizedPath;
+  }
+
+  #normalizeEntryName(name, label) {
+    const normalizedName = typeof name === 'string' ? name.trim() : '';
+
+    if (
+      normalizedName === '' ||
+      normalizedName === '.' ||
+      normalizedName === '..' ||
+      normalizedName === '.git' ||
+      /[\\/]/.test(normalizedName)
+    ) {
+      throw new Error(`${label} must be a simple name without path separators.`);
+    }
+
+    return normalizedName;
   }
 }

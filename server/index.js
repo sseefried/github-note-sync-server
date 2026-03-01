@@ -118,6 +118,54 @@ app.get('/api/repos/:repoAlias/public-key', async (request, response) => {
   }
 });
 
+app.get('/api/repos/:repoAlias', async (request, response) => {
+  const manager = requireRepoManager(response);
+
+  if (!manager) {
+    return;
+  }
+
+  try {
+    response.json(await manager.getRepoAliasDetails(request.params.repoAlias));
+  } catch (error) {
+    sendError(response, error, 400);
+  }
+});
+
+app.put('/api/repos/:repoAlias', async (request, response) => {
+  const manager = requireRepoManager(response);
+
+  if (!manager) {
+    return;
+  }
+
+  try {
+    const { repo } = request.body ?? {};
+
+    if (typeof repo !== 'string') {
+      return response.status(400).json({ error: 'Request body must include a "repo" string.' });
+    }
+
+    response.json(await manager.updateRepoAlias(request.params.repoAlias, repo));
+  } catch (error) {
+    sendError(response, error, 400);
+  }
+});
+
+app.delete('/api/repos/:repoAlias', async (request, response) => {
+  const manager = requireRepoManager(response);
+
+  if (!manager) {
+    return;
+  }
+
+  try {
+    response.json(await manager.deleteRepoAlias(request.params.repoAlias));
+  } catch (error) {
+    sendError(response, error, 400);
+  }
+});
+
 app.get('/api/bootstrap', async (request, response) => {
   const manager = requireRepoManager(response);
 
@@ -198,7 +246,84 @@ app.post('/api/files', async (request, response) => {
 
     response.status(201).json({
       ok: true,
-      status: await manager.createFile(repoAlias, filePath),
+      ...(await manager.createFile(repoAlias, filePath)),
+    });
+  } catch (error) {
+    sendError(response, error, 400);
+  }
+});
+
+app.post('/api/folders', async (request, response) => {
+  const manager = requireRepoManager(response);
+
+  if (!manager) {
+    return;
+  }
+
+  try {
+    const { repoAlias, parentPath = '', name } = request.body ?? {};
+
+    if (
+      typeof repoAlias !== 'string' ||
+      typeof parentPath !== 'string' ||
+      typeof name !== 'string'
+    ) {
+      return response.status(400).json({
+        error: 'Request body must include "repoAlias", "parentPath", and "name" strings.',
+      });
+    }
+
+    response.status(201).json({
+      ok: true,
+      ...(await manager.createFolder(repoAlias, parentPath, name)),
+    });
+  } catch (error) {
+    sendError(response, error, 400);
+  }
+});
+
+app.delete('/api/folders', async (request, response) => {
+  const manager = requireRepoManager(response);
+
+  if (!manager) {
+    return;
+  }
+
+  try {
+    const { repoAlias, path: folderPath } = request.body ?? {};
+
+    if (typeof repoAlias !== 'string' || typeof folderPath !== 'string') {
+      return response.status(400).json({
+        error: 'Request body must include "repoAlias" and "path" strings.',
+      });
+    }
+
+    response.json({
+      ok: true,
+      ...(await manager.deleteFolder(repoAlias, folderPath)),
+    });
+  } catch (error) {
+    sendError(response, error, 400);
+  }
+});
+
+app.post('/api/refresh', async (request, response) => {
+  const manager = requireRepoManager(response);
+
+  if (!manager) {
+    return;
+  }
+
+  try {
+    const repoAlias = getRepoAliasFromRequest(request);
+
+    if (!repoAlias) {
+      return response.status(400).json({ error: 'repoAlias is required.' });
+    }
+
+    response.json({
+      ok: true,
+      ...(await manager.refreshTree(repoAlias)),
     });
   } catch (error) {
     sendError(response, error, 400);
