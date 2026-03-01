@@ -4,7 +4,6 @@ import { loadConfig } from './config.js';
 import { RepoManager } from './repo-manager.js';
 
 const app = express();
-const port = Number.parseInt(process.env.PORT ?? '3001', 10);
 
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
@@ -12,6 +11,7 @@ app.use(express.json({ limit: '10mb' }));
 let repoManager = null;
 let startupError = null;
 let syncTimer = null;
+let serverConfig = null;
 
 function sendError(response, error, status = 500) {
   response.status(status).json({ error: error.message });
@@ -23,6 +23,7 @@ async function bootstrap() {
     const manager = new RepoManager(config);
     await manager.initialize();
 
+    serverConfig = config;
     repoManager = manager;
     startupError = null;
 
@@ -355,8 +356,9 @@ app.post('/api/sync', async (request, response) => {
 
 await bootstrap();
 
-const server = app.listen(port, '0.0.0.0', () => {
-  console.log(`GitHub Note Sync server listening on http://0.0.0.0:${port}`);
+const listenPort = serverConfig?.port ?? 3001;
+const server = app.listen(listenPort, '0.0.0.0', () => {
+  console.log(`GitHub Note Sync server listening on http://0.0.0.0:${listenPort}`);
 });
 
 async function shutdown() {

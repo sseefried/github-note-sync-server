@@ -4,6 +4,7 @@ import path from 'node:path';
 
 export const APP_ROOT = process.cwd();
 export const CONFIG_PATH = path.join(APP_ROOT, 'config.json');
+export const DEFAULT_PORT = 3001;
 export const DEFAULT_SYNC_INTERVAL_MS = 30_000;
 export const SERVER_DATA_DIR = path.join(os.homedir(), '.local', 'github-note-sync-server');
 export const REPOS_DIR = path.join(SERVER_DATA_DIR, 'repos');
@@ -52,6 +53,17 @@ export async function loadConfig() {
     Number.isInteger(parsed.syncIntervalMs) && parsed.syncIntervalMs > 0
       ? parsed.syncIntervalMs
       : DEFAULT_SYNC_INTERVAL_MS;
+  const configuredPort =
+    Number.isInteger(parsed.port) && parsed.port > 0 && parsed.port <= 65_535
+      ? parsed.port
+      : DEFAULT_PORT;
+
+  if (
+    typeof parsed.port !== 'undefined' &&
+    (!Number.isInteger(parsed.port) || parsed.port <= 0 || parsed.port > 65_535)
+  ) {
+    throw new ConfigError('config.json "port" must be an integer between 1 and 65535.');
+  }
 
   if (
     typeof parsed.gitUserName !== 'undefined' &&
@@ -72,6 +84,12 @@ export async function loadConfig() {
     dataDir: SERVER_DATA_DIR,
     reposDir: REPOS_DIR,
     sshKeygenTestDir: SSH_KEYGEN_TEST_DIR,
+    port:
+      Number.isInteger(Number.parseInt(process.env.PORT ?? '', 10)) &&
+      Number.parseInt(process.env.PORT ?? '', 10) > 0 &&
+      Number.parseInt(process.env.PORT ?? '', 10) <= 65_535
+        ? Number.parseInt(process.env.PORT ?? '', 10)
+        : configuredPort,
     syncIntervalMs,
     gitUserName:
       typeof parsed.gitUserName === 'string' && parsed.gitUserName.trim() !== ''
