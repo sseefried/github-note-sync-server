@@ -41,6 +41,10 @@ function buildRepoConfig(appConfig, metadata) {
   };
 }
 
+function logSyncEvent(repoAlias, reason, summary) {
+  console.log(`[${new Date().toISOString()}] repo-alias=${repoAlias} sync=${reason} ${summary}`);
+}
+
 export class RepoManager {
   constructor(config) {
     this.config = config;
@@ -161,9 +165,13 @@ export class RepoManager {
 
   async syncNow(repoAlias, reason = 'manual') {
     const service = await this.#ensureServiceReady(repoAlias, reason);
+    logSyncEvent(repoAlias, reason, 'started');
+
+    const result = await service.syncNow(reason);
+    logSyncEvent(repoAlias, reason, `completed result=${result.kind}`);
 
     return {
-      result: await service.syncNow(reason),
+      result,
       status: service.getStatus(),
       tree: await service.listTree(),
     };
@@ -177,8 +185,15 @@ export class RepoManager {
         }
 
         try {
+          logSyncEvent(service.config.repoAlias, 'interval', 'started');
           await service.syncNow('interval');
+          logSyncEvent(
+            service.config.repoAlias,
+            'interval',
+            `completed status=${service.getStatus().lastSyncStatus}`,
+          );
         } catch (error) {
+          logSyncEvent(service.config.repoAlias, 'interval', `failed error=${error.message}`);
           console.error(error);
         }
       }),

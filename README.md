@@ -34,6 +34,7 @@ The server repository owns per-repository local Git clones, generates SSH keys f
    - `repo`: `git@github.com:<username>/<repo>` or `git@github.com:<username>/<repo>.git`
 5. Fetch the public key from `GET /api/repos/:repoAlias/public-key` and add it to GitHub so the server can clone and push.
 6. All server data lives under `$HOME/.local/github-note-sync-server`.
+7. Each sync attempt is logged to stdout with an ISO timestamp and the `repoAlias`.
 
 ## Configuration
 
@@ -62,7 +63,7 @@ The server never returns private keys.
 
 ## Architecture
 
-The server is an Express API with a repo manager and a per-alias Git orchestration layer. On startup it verifies that `ssh-keygen` exists and can successfully generate an ED25519 keypair, then deletes that startup-check keypair. Repo aliases are stored under `$HOME/.local/github-note-sync-server/repos/<repoAlias>`, with metadata, SSH keys, and a clone directory isolated from each other. The API lets the client create aliases, retrieve public keys, and then operate on one alias at a time. The Git layer uses shell `git` commands with `GIT_SSH_COMMAND` pointing at the server-generated private key for that alias.
+The server is an Express API with a repo manager and a per-alias Git orchestration layer. On startup it verifies that `ssh-keygen` exists and can successfully generate an ED25519 keypair, then deletes that startup-check keypair. Repo aliases are stored under `$HOME/.local/github-note-sync-server/repos/<repoAlias>`, with metadata, SSH keys, and a clone directory isolated from each other. The API lets the client create aliases, retrieve public keys, and then operate on one alias at a time. The Git layer uses shell `git` commands with `GIT_SSH_COMMAND` pointing at the server-generated private key for that alias, and the repo manager logs each sync attempt with its alias and timestamp.
 
 Design philosophy:
 
