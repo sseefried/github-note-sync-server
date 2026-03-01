@@ -1,0 +1,5 @@
+- always update the README.md with installation and usage instructions
+- always update the Architecture section with the basic design and design philosophy of the app
+- this repository is the backend API and git-sync engine only
+- the sibling frontend repository is ../github-note-sync-client
+- I specifically allow access to local networks while testing this app e.g. localhost

@@ -1,0 +1,5 @@
+{
+  "syncIntervalMs": 30000,
+  "gitUserName": "GitHub Note Sync",
+  "gitUserEmail": "note-sync@example.com"
+}
