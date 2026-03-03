@@ -42,7 +42,65 @@ The server repository is the backend API and git-sync engine. It owns users, pas
 10. All server data lives under `$HOME/.local/github-note-sync-server`.
 11. Each sync attempt is logged to stdout with an ISO timestamp, the authenticated user id, and the `repoAlias`.
 
-For browser clients on another origin, set `allowedOrigins` in `config.json`. The bundled web client uses bearer tokens, so it does not depend on cross-site cookies. If you build another browser integration that uses cookies across sites, deploy over HTTPS and use `sessionCookieSameSite: "none"` with `sessionCookieSecure: true`.
+For browser clients on another origin, set `allowedOrigins` in `config.json`. The bundled web client uses bearer tokens, so it does not depend on cross-site cookies. If you want HTTPS locally or in production, terminate TLS in a reverse proxy such as nginx or Caddy and proxy through to this HTTP server.
+
+## Local HTTPS Testing
+
+Use Caddy to terminate TLS locally while keeping the server itself on HTTP.
+
+1. Install Caddy on macOS:
+
+   ```bash
+   brew install caddy
+   ```
+
+2. Create a `Caddyfile` somewhere convenient:
+
+   ```caddy
+   notes.localhost {
+     reverse_proxy 127.0.0.1:5173
+   }
+
+   api.notes.localhost {
+     reverse_proxy 127.0.0.1:3001
+   }
+   ```
+
+3. Configure the server origin allowlist in `config.json`:
+
+   ```json
+   {
+     "port": 3001,
+     "syncIntervalMs": 30000,
+     "gitUserName": "GitHub Note Sync",
+     "gitUserEmail": "note-sync@example.com",
+     "allowedOrigins": [
+       "https://notes.localhost"
+     ]
+   }
+   ```
+
+4. Start the server:
+
+   ```bash
+   npm run dev
+   ```
+
+5. Start the client from the client repository:
+
+   ```bash
+   npm run dev -- --server-url=https://api.notes.localhost
+   ```
+
+6. Start Caddy with that config:
+
+   ```bash
+   caddy run --config /absolute/path/to/Caddyfile
+   ```
+
+7. Open the app at `https://notes.localhost`.
+
+In this setup, Caddy terminates HTTPS and proxies to the local HTTP dev servers, which keeps local transport aligned with a production reverse-proxy deployment.
 
 ## Deployment
 
@@ -82,13 +140,8 @@ That script prompts for the public and internal IPs, ports, and app user, then p
   "syncIntervalMs": 30000,
   "gitUserName": "GitHub Note Sync",
   "gitUserEmail": "note-sync@example.com",
-  "allowRegistration": true,
-  "sessionTtlMs": 2592000000,
-  "sessionCookieSecure": false,
-  "sessionCookieSameSite": "lax",
   "allowedOrigins": [
-    "http://127.0.0.1:4173",
-    "http://localhost:4173"
+    "https://notes.localhost"
   ]
 }
 ```
@@ -131,7 +184,7 @@ The server never returns private keys.
 
 ## Architecture
 
-The server is an Express API with two server-owned state layers: authentication and repo orchestration. Authentication stores users under `$HOME/.local/github-note-sync-server/users/<userId>/profile.json`, hashes passwords with Node's built-in `scrypt`, persists opaque sessions under `$HOME/.local/github-note-sync-server/sessions`, and resolves the authenticated user from either a session cookie or a bearer token on every request. Repo state is namespaced per user under `$HOME/.local/github-note-sync-server/users/<userId>/repos/<repoAlias>`, where each alias contains metadata, a clone directory, an SSH directory, and a small UI-state file. On startup the server loads optional local configuration, validates cookie/origin settings, verifies that `ssh-keygen` can successfully generate an ED25519 keypair, and deletes that startup-check keypair. The repo manager threads `userId` through every lookup so the same `repoAlias` can exist for multiple users without collision, and the Git layer still shells out with `GIT_SSH_COMMAND` pointed at the server-generated private key for that specific user-owned alias.
+The server is an Express API with two server-owned state layers: authentication and repo orchestration. Authentication stores users under `$HOME/.local/github-note-sync-server/users/<userId>/profile.json`, hashes passwords with Node's built-in `scrypt`, persists opaque sessions under `$HOME/.local/github-note-sync-server/sessions`, and resolves the authenticated user from either a session cookie or a bearer token on every request. Repo state is namespaced per user under `$HOME/.local/github-note-sync-server/users/<userId>/repos/<repoAlias>`, where each alias contains metadata, a clone directory, an SSH directory, and a small UI-state file. On startup the server loads optional local configuration, validates cookie/origin settings, verifies that `ssh-keygen` can successfully generate an ED25519 keypair, and deletes that startup-check keypair. The repo manager threads `userId` through every lookup so the same `repoAlias` can exist for multiple users without collision, and the Git layer still shells out with `GIT_SSH_COMMAND` pointed at the server-generated private key for that specific user-owned alias. Transport security is intentionally external: both local HTTPS testing and production deployments are expected to terminate TLS in a reverse proxy such as Caddy or nginx before forwarding requests to this HTTP service.
 
 Design philosophy:
 
@@ -142,5 +195,6 @@ Design philosophy:
 - Accept editor keystroke-driven writes, but batch Git commits onto a sync interval to avoid noisy history.
 - Keep empty-folder UI affordances separate from Git by storing that state outside the repository clone.
 - Require explicit browser origin configuration once deployments move beyond local/private-network testing.
+- Keep TLS termination outside the app so local and production network topology stay aligned.
 - Keep runtime configuration local and human-editable, with simple precedence rules.
 - Separate app-user service management from root-owned network and reverse-proxy changes.
