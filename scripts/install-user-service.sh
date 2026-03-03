@@ -9,6 +9,7 @@ PORT="3001"
 SYNC_INTERVAL_MS="30000"
 GIT_USER_NAME="GitHub Note Sync"
 GIT_USER_EMAIL="note-sync@example.com"
+ALLOWED_ORIGINS=()
 
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -22,6 +23,7 @@ Options:
   --sync-interval-ms MS      Auto-sync interval in milliseconds
   --git-user-name NAME       Git commit author name used by the server
   --git-user-email EMAIL     Git commit author email used by the server
+  --allowed-origin URL       Browser origin allowed by CORS (repeatable)
   --help                     Show this help
 EOF
 }
@@ -59,12 +61,30 @@ copy_repo() {
 }
 
 write_config() {
+  local allowed_origins_json='[]'
+  local allowed_origin
+
+  if ((${#ALLOWED_ORIGINS[@]} > 0)); then
+    allowed_origins_json='['
+
+    for allowed_origin in "${ALLOWED_ORIGINS[@]}"; do
+      if [[ "${allowed_origins_json}" != '[' ]]; then
+        allowed_origins_json+=', '
+      fi
+
+      allowed_origins_json+="\"$(json_escape "${allowed_origin}")\""
+    done
+
+    allowed_origins_json+=']'
+  fi
+
   cat > "${INSTALL_DIR}/config.json" <<EOF
 {
   "port": ${PORT},
   "syncIntervalMs": ${SYNC_INTERVAL_MS},
   "gitUserName": "$(json_escape "${GIT_USER_NAME}")",
-  "gitUserEmail": "$(json_escape "${GIT_USER_EMAIL}")"
+  "gitUserEmail": "$(json_escape "${GIT_USER_EMAIL}")",
+  "allowedOrigins": ${allowed_origins_json}
 }
 EOF
 }
@@ -111,6 +131,10 @@ while (($# > 0)); do
       ;;
     --git-user-email)
       GIT_USER_EMAIL="$2"
+      shift 2
+      ;;
+    --allowed-origin)
+      ALLOWED_ORIGINS+=("$2")
       shift 2
       ;;
     --help)

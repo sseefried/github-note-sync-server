@@ -111,7 +111,8 @@ scripts/install-user-service.sh \
   --port 3001 \
   --sync-interval-ms 30000 \
   --git-user-name "GitHub Note Sync" \
-  --git-user-email "note-sync@example.com"
+  --git-user-email "note-sync@example.com" \
+  --allowed-origin=https://notes.example.com
 ```
 
 This script:
@@ -127,9 +128,9 @@ Root-side deployment guidance for both the internal app host and the external re
 scripts/print-root-deployment-steps.sh
 ```
 
-That script prompts for the public and internal IPs, ports, and app user, then prints:
+That script prompts for the public hostname, internal IPs, ports, and app user, then prints:
 - the root steps for the internal host, including `loginctl enable-linger` and firewall rules
-- the nginx reverse-proxy configuration for the external host
+- the nginx reverse-proxy configuration for the external host, including HTTP-to-HTTPS redirect and certificate paths
 - verification commands for both machines
 
 ## Configuration
@@ -196,5 +197,6 @@ Design philosophy:
 - Keep empty-folder UI affordances separate from Git by storing that state outside the repository clone.
 - Require explicit browser origin configuration once deployments move beyond local/private-network testing.
 - Keep TLS termination outside the app so local and production network topology stay aligned.
+- Treat HTTPS at the reverse proxy as mandatory and reject requests that bypass that boundary.
 - Keep runtime configuration local and human-editable, with simple precedence rules.
 - Separate app-user service management from root-owned network and reverse-proxy changes.

@@ -19,12 +19,11 @@ INTERNAL_APP_IP="$(prompt 'Internal app-server IP' '192.168.1.10')"
 APP_USER="$(prompt 'App user on the internal server' "${USER:-app}")"
 CLIENT_PORT="$(prompt 'Internal client service port' '4173')"
 SERVER_PORT="$(prompt 'Internal server service port' '3001')"
-PUBLIC_NAME="$(prompt 'Public hostname or IP served by nginx' "${PUBLIC_PROXY_IP}")"
-PUBLIC_SCHEME="$(prompt 'Public scheme for the client service (http/https)' 'http')"
+PUBLIC_NAME="$(prompt 'Public hostname served by nginx' 'notes.example.com')"
 INTERNAL_FIREWALL_TOOL="$(prompt 'Internal firewall tool (ufw/none)' 'ufw')"
 EXTERNAL_FIREWALL_TOOL="$(prompt 'External firewall tool (ufw/none)' 'ufw')"
 
-PUBLIC_BASE_URL="${PUBLIC_SCHEME}://${PUBLIC_NAME}"
+PUBLIC_BASE_URL="https://${PUBLIC_NAME}"
 
 cat <<EOF
 GitHub Note Sync deployment instructions
@@ -38,7 +37,7 @@ Summary
 - App user on internal host: ${APP_USER}
 - Internal client port: ${CLIENT_PORT}
 - Internal server API port: ${SERVER_PORT}
-- Public base URL for the client service: ${PUBLIC_BASE_URL}
+- Public HTTPS base URL for the client service: ${PUBLIC_BASE_URL}
 
 Run these commands as root on the internal app host (${INTERNAL_APP_IP})
 -----------------------------------------------------------------------
@@ -76,9 +75,14 @@ cat <<EOF
 
    --server-url=${PUBLIC_BASE_URL}
 
+5. The server user-service installer should allow the public browser origin explicitly:
+
+   --allowed-origin=${PUBLIC_BASE_URL}
+
 Run these commands as root on the external reverse-proxy host (${PUBLIC_PROXY_IP})
 ---------------------------------------------------------------------------------
 1. Install and enable nginx if it is not already present.
+   Install certificates for ${PUBLIC_NAME} before you enable the HTTPS server block below.
 
 2. Open the public firewall for HTTP and HTTPS:
 EOF
@@ -106,13 +110,23 @@ server {
     listen 80;
     server_name ${PUBLIC_NAME};
 
+    return 301 https://\$host\$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name ${PUBLIC_NAME};
+
+    ssl_certificate /etc/letsencrypt/live/${PUBLIC_NAME}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${PUBLIC_NAME}/privkey.pem;
+
     location /api/ {
         proxy_pass http://${INTERNAL_APP_IP}:${SERVER_PORT};
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Forwarded-Proto https;
     }
 
     location / {
@@ -121,7 +135,7 @@ server {
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Forwarded-Proto https;
     }
 }
 
@@ -131,16 +145,16 @@ server {
    sudo nginx -t
    sudo systemctl reload nginx
 
-5. Optional TLS:
-   - If you want HTTPS, add certificates with certbot or your preferred ACME flow and then switch the public scheme to https.
-   - If you are serving only by IP (${PUBLIC_PROXY_IP}), TLS is usually not practical with public ACME certs.
+5. Obtain and install certificates before reloading nginx.
+   - For a public deployment, use certbot or your preferred ACME flow for ${PUBLIC_NAME}.
+   - If you do not have a DNS name for ${PUBLIC_NAME}, stop here and create one first. This deployment now assumes HTTPS-only browser access.
 
 Verification
 ------------
 From the external reverse-proxy host:
 
    curl -I http://${INTERNAL_APP_IP}:${CLIENT_PORT}
-   curl -I http://${INTERNAL_APP_IP}:${SERVER_PORT}/api/repos
+   curl -I -H 'X-Forwarded-Proto: https' http://${INTERNAL_APP_IP}:${SERVER_PORT}/api/repos
 
 From anywhere that can reach the external host:
 
@@ -150,5 +164,6 @@ From anywhere that can reach the external host:
 Notes
 -----
 - This script does not make root-owned changes. It only prints the required commands and nginx config.
+- The client and server both assume browser traffic arrives through HTTPS at the reverse proxy.
 - Re-run the app-user installers after code changes. Re-run the nginx steps only if the IPs, ports, or hostname change.
 EOF
