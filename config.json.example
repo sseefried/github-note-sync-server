@@ -2,5 +2,13 @@
   "port": 3001,
   "syncIntervalMs": 30000,
   "gitUserName": "GitHub Note Sync",
-  "gitUserEmail": "note-sync@example.com"
+  "gitUserEmail": "note-sync@example.com",
+  "allowRegistration": true,
+  "sessionTtlMs": 2592000000,
+  "sessionCookieSecure": false,
+  "sessionCookieSameSite": "lax",
+  "allowedOrigins": [
+    "http://127.0.0.1:4173",
+    "http://localhost:4173"
+  ]
 }

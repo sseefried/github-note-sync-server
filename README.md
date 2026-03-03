@@ -1,6 +1,6 @@
 # GitHub Note Sync Server
 
-The server repository owns per-repository local Git clones, generates SSH keys for each repo alias, applies text-file edits received from the web client, and periodically syncs those edits to GitHub. Each repo alias is isolated under a server-managed data directory, and the remote repository remains authoritative: if origin moves ahead, the server overwrites its local clone to match.
+The server repository is the backend API and git-sync engine. It owns users, password hashes, sessions, per-user repo aliases, local Git clones, and per-alias SSH keypairs. Private SSH keys are generated and stored only on the server machine.
 
 ## Installation
 
@@ -12,7 +12,7 @@ The server repository owns per-repository local Git clones, generates SSH keys f
    ```
 
 3. Ensure `ssh-keygen` is installed and available in `PATH`.
-4. Optionally copy `config.json.example` to `config.json` if you want to override the port, sync interval, or commit identity.
+4. Optionally copy `config.json.example` to `config.json` and adjust auth, cookie, origin, sync, or commit settings.
 
 ## Usage
 
@@ -29,12 +29,50 @@ The server repository owns per-repository local Git clones, generates SSH keys f
    ```
 
 3. The API listens on `http://localhost:3001` by default. You can override that with `config.json`, or with `PORT=<port>` which takes precedence over the config file.
-4. Register a repo alias from the client or via `POST /api/repos` with:
+4. Register a user from the client or via `POST /api/auth/register` with:
+   - `username`: letters, numbers, `_`, and `-` only
+   - `password`: at least 8 characters
+5. Registration stays open by default so multiple server users can be created. Set `allowRegistration` to `false` in `config.json` if you want to close self-service signup after provisioning accounts.
+6. Log in from the client or via `POST /api/auth/login`. The bundled web client requests a bearer `sessionToken`, while generic browser integrations can still rely on a session cookie if they want to.
+7. Send `X-Session-Transport: token` to `POST /api/auth/register` or `POST /api/auth/login` to receive a bearer `sessionToken` in the JSON response instead of relying on cookies.
+8. Create a repo alias from the client or via `POST /api/repos` with:
    - `repoAlias`: letters, numbers, `_`, and `-` only
    - `repo`: `git@github.com:<username>/<repo>` or `git@github.com:<username>/<repo>.git`
-5. Fetch the public key from `GET /api/repos/:repoAlias/public-key` and add it to GitHub so the server can clone and push.
-6. All server data lives under `$HOME/.local/github-note-sync-server`.
-7. Each sync attempt is logged to stdout with an ISO timestamp and the `repoAlias`.
+9. Fetch the public key from `GET /api/repos/:repoAlias/public-key` and add it to GitHub so the server can clone and push for that user-owned alias.
+10. All server data lives under `$HOME/.local/github-note-sync-server`.
+11. Each sync attempt is logged to stdout with an ISO timestamp, the authenticated user id, and the `repoAlias`.
+
+For browser clients on another origin, set `allowedOrigins` in `config.json`. The bundled web client uses bearer tokens, so it does not depend on cross-site cookies. If you build another browser integration that uses cookies across sites, deploy over HTTPS and use `sessionCookieSameSite: "none"` with `sessionCookieSecure: true`.
+
+## Deployment
+
+App-user deployment on the internal server:
+
+```bash
+scripts/install-user-service.sh \
+  --port 3001 \
+  --sync-interval-ms 30000 \
+  --git-user-name "GitHub Note Sync" \
+  --git-user-email "note-sync@example.com"
+```
+
+This script:
+- copies the repository into `~/.local/opt/github-note-sync-server`
+- overwrites `config.json` in the installed copy
+- installs production dependencies with `npm ci --omit=dev`
+- writes `~/.config/systemd/user/github-note-sync-server.service`
+- reloads, enables, and restarts the user service
+
+Root-side deployment guidance for both the internal app host and the external reverse proxy host:
+
+```bash
+scripts/print-root-deployment-steps.sh
+```
+
+That script prompts for the public and internal IPs, ports, and app user, then prints:
+- the root steps for the internal host, including `loginctl enable-linger` and firewall rules
+- the nginx reverse-proxy configuration for the external host
+- verification commands for both machines
 
 ## Configuration
 
@@ -43,15 +81,38 @@ The server repository owns per-repository local Git clones, generates SSH keys f
   "port": 3001,
   "syncIntervalMs": 30000,
   "gitUserName": "GitHub Note Sync",
-  "gitUserEmail": "note-sync@example.com"
+  "gitUserEmail": "note-sync@example.com",
+  "allowRegistration": true,
+  "sessionTtlMs": 2592000000,
+  "sessionCookieSecure": false,
+  "sessionCookieSameSite": "lax",
+  "allowedOrigins": [
+    "http://127.0.0.1:4173",
+    "http://localhost:4173"
+  ]
 }
 ```
 
 These settings are optional. If `config.json` is absent, the server starts with defaults. `PORT` from the environment overrides `config.json.port`.
 
+- `allowRegistration`: when `true`, anyone who can reach the server can self-register. Set it to `false` if you want to close signup after provisioning users.
+- `sessionTtlMs`: sliding session lifetime in milliseconds.
+- `sessionCookieSecure`: must be `true` when `sessionCookieSameSite` is `"none"`.
+- `sessionCookieSameSite`: `"lax"`, `"strict"`, or `"none"`.
+- `allowedOrigins`: explicit browser origins allowed to send credentialed requests. Loopback, private IPv4, and `.local` origins are also accepted for local testing.
+
 ## API
 
-- `GET /api/repos`: list all registered `repoAlias` values
+Auth:
+- `GET /api/auth/session`: return authentication status, current user, and registration policy
+- `POST /api/auth/register`: create a user account when registration is open, then start a session
+- `POST /api/auth/login`: authenticate and start a session
+- `POST /api/auth/logout`: revoke the current session
+
+For non-browser clients, send `X-Session-Transport: token` on register/login to receive a `sessionToken` in the JSON response. All authenticated endpoints also accept `Authorization: Bearer <sessionToken>`.
+
+Repo management and editing, all scoped to the authenticated user:
+- `GET /api/repos`: list that user's `repoAlias` values
 - `POST /api/repos`: create or return a repo alias and generate its SSH keypair
 - `GET /api/repos/:repoAlias`: return non-secret metadata for one alias
 - `PUT /api/repos/:repoAlias`: update the GitHub SSH repo URL for one alias
@@ -70,15 +131,16 @@ The server never returns private keys.
 
 ## Architecture
 
-The server is an Express API with a repo manager and a per-alias Git orchestration layer. On startup it loads optional local configuration, including the listen port, verifies that `ssh-keygen` exists and can successfully generate an ED25519 keypair, then deletes that startup-check keypair. Repo aliases are stored under `$HOME/.local/github-note-sync-server/repos/<repoAlias>`, with metadata, SSH keys, a clone directory, and a small UI-state file isolated from each other. The API lets the client create aliases, retrieve public keys, update alias metadata, delete aliases and their local server state, create and delete empty folders, force-refresh by fetching and hard-resetting to the remote repo before rebuilding the tree, and then operate on one alias at a time. The Git layer uses shell `git` commands with `GIT_SSH_COMMAND` pointing at the server-generated private key for that alias, and the repo manager logs each sync attempt with its alias and timestamp while merging ephemeral empty-folder state into the returned tree.
+The server is an Express API with two server-owned state layers: authentication and repo orchestration. Authentication stores users under `$HOME/.local/github-note-sync-server/users/<userId>/profile.json`, hashes passwords with Node's built-in `scrypt`, persists opaque sessions under `$HOME/.local/github-note-sync-server/sessions`, and resolves the authenticated user from either a session cookie or a bearer token on every request. Repo state is namespaced per user under `$HOME/.local/github-note-sync-server/users/<userId>/repos/<repoAlias>`, where each alias contains metadata, a clone directory, an SSH directory, and a small UI-state file. On startup the server loads optional local configuration, validates cookie/origin settings, verifies that `ssh-keygen` can successfully generate an ED25519 keypair, and deletes that startup-check keypair. The repo manager threads `userId` through every lookup so the same `repoAlias` can exist for multiple users without collision, and the Git layer still shells out with `GIT_SSH_COMMAND` pointed at the server-generated private key for that specific user-owned alias.
 
 Design philosophy:
 
-- Keep the state model explicit: Git working tree plus remote history are the persistence layer for each alias.
+- Keep identity server-owned so passwords, sessions, SSH keys, and repo authorization live in one place.
+- Keep SSH private keys on the server and never expose them over the API.
+- Namespace aliases by user instead of assuming a global alias space.
 - Treat the remote repository as authoritative and make each local clone disposable.
-- Generate and store SSH keys on the server so private keys never need to leave the machine.
 - Accept editor keystroke-driven writes, but batch Git commits onto a sync interval to avoid noisy history.
 - Keep empty-folder UI affordances separate from Git by storing that state outside the repository clone.
-- Let the UI explicitly reconcile against the remote repo so ephemeral folder state can be discarded on demand.
+- Require explicit browser origin configuration once deployments move beyond local/private-network testing.
 - Keep runtime configuration local and human-editable, with simple precedence rules.
-- Keep server data in one predictable home-directory location.
+- Separate app-user service management from root-owned network and reverse-proxy changes.

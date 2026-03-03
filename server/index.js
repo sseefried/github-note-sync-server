@@ -1,30 +1,92 @@
 import cors from 'cors';
 import express from 'express';
+import { AuthManager } from './auth-manager.js';
 import { loadConfig } from './config.js';
 import { RepoManager } from './repo-manager.js';
 
 const app = express();
 
-app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
+let authManager = null;
 let repoManager = null;
 let startupError = null;
 let syncTimer = null;
+let sessionPruneTimer = null;
 let serverConfig = null;
 
-function sendError(response, error, status = 500) {
-  response.status(status).json({ error: error.message });
+function isPrivateIpv4Address(hostname) {
+  const parts = hostname.split('.').map((part) => Number.parseInt(part, 10));
+
+  if (
+    parts.length !== 4 ||
+    parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)
+  ) {
+    return false;
+  }
+
+  return (
+    parts[0] === 10 ||
+    parts[0] === 127 ||
+    (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) ||
+    (parts[0] === 192 && parts[1] === 168)
+  );
+}
+
+function isAllowedOrigin(origin, config) {
+  if (typeof origin !== 'string' || origin.trim() === '') {
+    return true;
+  }
+
+  if (config.allowedOrigins.includes(origin)) {
+    return true;
+  }
+
+  try {
+    const parsedOrigin = new URL(origin);
+    const hostname = parsedOrigin.hostname.toLowerCase();
+
+    return (
+      hostname === 'localhost' ||
+      hostname === '::1' ||
+      isPrivateIpv4Address(hostname) ||
+      hostname.endsWith('.local')
+    );
+  } catch {
+    return false;
+  }
+}
+
+app.use(
+  cors({
+    credentials: true,
+    origin(origin, callback) {
+      if (!serverConfig) {
+        callback(null, false);
+        return;
+      }
+
+      callback(null, isAllowedOrigin(origin, serverConfig));
+    },
+  }),
+);
+
+function sendError(response, error, fallbackStatus = 500) {
+  response.status(error?.statusCode ?? fallbackStatus).json({ error: error.message });
 }
 
 async function bootstrap() {
   try {
     const config = await loadConfig();
-    const manager = new RepoManager(config);
-    await manager.initialize();
+    const nextAuthManager = new AuthManager(config);
+    const nextRepoManager = new RepoManager(config);
+
+    await nextAuthManager.initialize();
+    await nextRepoManager.initialize();
 
     serverConfig = config;
-    repoManager = manager;
+    authManager = nextAuthManager;
+    repoManager = nextRepoManager;
     startupError = null;
 
     syncTimer = setInterval(() => {
@@ -32,14 +94,20 @@ async function bootstrap() {
         console.error(error);
       });
     }, config.syncIntervalMs);
+
+    sessionPruneTimer = setInterval(() => {
+      authManager.pruneExpiredSessions().catch((error) => {
+        console.error(error);
+      });
+    }, 60 * 60 * 1000);
   } catch (error) {
     startupError = error;
     console.error(error);
   }
 }
 
-function requireRepoManager(response) {
-  if (!repoManager) {
+function requireService(service, response) {
+  if (!service) {
     response.status(503).json({
       error:
         startupError?.message ??
@@ -48,7 +116,25 @@ function requireRepoManager(response) {
     return null;
   }
 
-  return repoManager;
+  return service;
+}
+
+async function requireAuthenticatedUser(request, response) {
+  const auth = requireService(authManager, response);
+
+  if (!auth) {
+    return null;
+  }
+
+  const userSession = await auth.getUserSessionFromRequest(request);
+
+  if (!userSession) {
+    auth.clearSessionCookie(response);
+    response.status(401).json({ error: 'Authentication required.' });
+    return null;
+  }
+
+  return userSession.user;
 }
 
 function getRepoAliasFromRequest(request) {
@@ -63,16 +149,109 @@ function getRepoAliasFromRequest(request) {
   return '';
 }
 
-app.get('/api/repos', async (_request, response) => {
-  const manager = requireRepoManager(response);
+function wantsTokenSession(request) {
+  return String(request.headers['x-session-transport'] ?? '').trim().toLowerCase() === 'token';
+}
 
-  if (!manager) {
+function getClientMetadata(request) {
+  return {
+    clientType: wantsTokenSession(request) || request.headers.authorization ? 'token' : 'browser',
+    ip: request.ip ?? null,
+    userAgent: request.headers['user-agent'] ?? null,
+  };
+}
+
+function applySessionResponse(request, response, auth, result, extras = {}) {
+  const payload = {
+    authenticated: true,
+    user: result.user,
+    ...extras,
+  };
+
+  if (wantsTokenSession(request)) {
+    payload.sessionToken = result.sessionToken;
+  } else {
+    auth.setSessionCookie(response, result.sessionToken);
+  }
+
+  response.json(payload);
+}
+
+app.get('/api/auth/session', async (request, response) => {
+  const auth = requireService(authManager, response);
+
+  if (!auth) {
+    return;
+  }
+
+  try {
+    response.json(await auth.getSessionStatus(request));
+  } catch (error) {
+    sendError(response, error);
+  }
+});
+
+app.post('/api/auth/register', async (request, response) => {
+  const auth = requireService(authManager, response);
+
+  if (!auth) {
+    return;
+  }
+
+  try {
+    const { username, password } = request.body ?? {};
+    const result = await auth.register(username, password, getClientMetadata(request));
+
+    response.status(201);
+    applySessionResponse(request, response, auth, result);
+  } catch (error) {
+    sendError(response, error, 400);
+  }
+});
+
+app.post('/api/auth/login', async (request, response) => {
+  const auth = requireService(authManager, response);
+
+  if (!auth) {
+    return;
+  }
+
+  try {
+    const { username, password } = request.body ?? {};
+    const result = await auth.login(username, password, getClientMetadata(request));
+    applySessionResponse(request, response, auth, result);
+  } catch (error) {
+    sendError(response, error, 401);
+  }
+});
+
+app.post('/api/auth/logout', async (request, response) => {
+  const auth = requireService(authManager, response);
+
+  if (!auth) {
+    return;
+  }
+
+  try {
+    await auth.revokeSessionFromRequest(request);
+    auth.clearSessionCookie(response);
+    response.json({ ok: true });
+  } catch (error) {
+    sendError(response, error);
+  }
+});
+
+app.get('/api/repos', async (request, response) => {
+  const manager = requireService(repoManager, response);
+  const user = await requireAuthenticatedUser(request, response);
+
+  if (!manager || !user) {
     return;
   }
 
   try {
     response.json({
-      repoAliases: await manager.listRepoAliases(),
+      repoAliases: await manager.listRepoAliases(user.id),
     });
   } catch (error) {
     sendError(response, error);
@@ -80,9 +259,10 @@ app.get('/api/repos', async (_request, response) => {
 });
 
 app.post('/api/repos', async (request, response) => {
-  const manager = requireRepoManager(response);
+  const manager = requireService(repoManager, response);
+  const user = await requireAuthenticatedUser(request, response);
 
-  if (!manager) {
+  if (!manager || !user) {
     return;
   }
 
@@ -95,7 +275,7 @@ app.post('/api/repos', async (request, response) => {
         .json({ error: 'Request body must include "repoAlias" and "repo" strings.' });
     }
 
-    const result = await manager.createRepoAlias(repoAlias, repo);
+    const result = await manager.createRepoAlias(user.id, repoAlias, repo);
     response.status(result.created ? 201 : 200).json(result);
   } catch (error) {
     sendError(response, error, 400);
@@ -103,15 +283,16 @@ app.post('/api/repos', async (request, response) => {
 });
 
 app.get('/api/repos/:repoAlias/public-key', async (request, response) => {
-  const manager = requireRepoManager(response);
+  const manager = requireService(repoManager, response);
+  const user = await requireAuthenticatedUser(request, response);
 
-  if (!manager) {
+  if (!manager || !user) {
     return;
   }
 
   try {
     response.json({
-      publicKey: await manager.getPublicKey(request.params.repoAlias),
+      publicKey: await manager.getPublicKey(user.id, request.params.repoAlias),
       repoAlias: request.params.repoAlias,
     });
   } catch (error) {
@@ -120,23 +301,25 @@ app.get('/api/repos/:repoAlias/public-key', async (request, response) => {
 });
 
 app.get('/api/repos/:repoAlias', async (request, response) => {
-  const manager = requireRepoManager(response);
+  const manager = requireService(repoManager, response);
+  const user = await requireAuthenticatedUser(request, response);
 
-  if (!manager) {
+  if (!manager || !user) {
     return;
   }
 
   try {
-    response.json(await manager.getRepoAliasDetails(request.params.repoAlias));
+    response.json(await manager.getRepoAliasDetails(user.id, request.params.repoAlias));
   } catch (error) {
     sendError(response, error, 400);
   }
 });
 
 app.put('/api/repos/:repoAlias', async (request, response) => {
-  const manager = requireRepoManager(response);
+  const manager = requireService(repoManager, response);
+  const user = await requireAuthenticatedUser(request, response);
 
-  if (!manager) {
+  if (!manager || !user) {
     return;
   }
 
@@ -147,30 +330,32 @@ app.put('/api/repos/:repoAlias', async (request, response) => {
       return response.status(400).json({ error: 'Request body must include a "repo" string.' });
     }
 
-    response.json(await manager.updateRepoAlias(request.params.repoAlias, repo));
+    response.json(await manager.updateRepoAlias(user.id, request.params.repoAlias, repo));
   } catch (error) {
     sendError(response, error, 400);
   }
 });
 
 app.delete('/api/repos/:repoAlias', async (request, response) => {
-  const manager = requireRepoManager(response);
+  const manager = requireService(repoManager, response);
+  const user = await requireAuthenticatedUser(request, response);
 
-  if (!manager) {
+  if (!manager || !user) {
     return;
   }
 
   try {
-    response.json(await manager.deleteRepoAlias(request.params.repoAlias));
+    response.json(await manager.deleteRepoAlias(user.id, request.params.repoAlias));
   } catch (error) {
     sendError(response, error, 400);
   }
 });
 
 app.get('/api/bootstrap', async (request, response) => {
-  const manager = requireRepoManager(response);
+  const manager = requireService(repoManager, response);
+  const user = await requireAuthenticatedUser(request, response);
 
-  if (!manager) {
+  if (!manager || !user) {
     return;
   }
 
@@ -180,30 +365,32 @@ app.get('/api/bootstrap', async (request, response) => {
     return response.status(400).json({ error: 'repoAlias is required.' });
   }
 
-  return response.json(await manager.getState(repoAlias));
+  return response.json(await manager.getState(user.id, repoAlias));
 });
 
 app.get('/api/file', async (request, response) => {
-  const manager = requireRepoManager(response);
+  const manager = requireService(repoManager, response);
+  const user = await requireAuthenticatedUser(request, response);
 
-  if (!manager) {
+  if (!manager || !user) {
     return;
   }
 
   try {
     const repoAlias = getRepoAliasFromRequest(request);
     const filePath = String(request.query.path ?? '');
-    const content = await manager.readFile(repoAlias, filePath);
-    response.json({ path: filePath, content });
+    const content = await manager.readFile(user.id, repoAlias, filePath);
+    response.json({ content, path: filePath });
   } catch (error) {
     sendError(response, error, 400);
   }
 });
 
 app.put('/api/file', async (request, response) => {
-  const manager = requireRepoManager(response);
+  const manager = requireService(repoManager, response);
+  const user = await requireAuthenticatedUser(request, response);
 
-  if (!manager) {
+  if (!manager || !user) {
     return;
   }
 
@@ -222,7 +409,7 @@ app.put('/api/file', async (request, response) => {
 
     response.json({
       ok: true,
-      status: await manager.writeFile(repoAlias, filePath, content),
+      status: await manager.writeFile(user.id, repoAlias, filePath, content),
     });
   } catch (error) {
     sendError(response, error, 400);
@@ -230,9 +417,10 @@ app.put('/api/file', async (request, response) => {
 });
 
 app.post('/api/files', async (request, response) => {
-  const manager = requireRepoManager(response);
+  const manager = requireService(repoManager, response);
+  const user = await requireAuthenticatedUser(request, response);
 
-  if (!manager) {
+  if (!manager || !user) {
     return;
   }
 
@@ -247,7 +435,7 @@ app.post('/api/files', async (request, response) => {
 
     response.status(201).json({
       ok: true,
-      ...(await manager.createFile(repoAlias, filePath)),
+      ...(await manager.createFile(user.id, repoAlias, filePath)),
     });
   } catch (error) {
     sendError(response, error, 400);
@@ -255,9 +443,10 @@ app.post('/api/files', async (request, response) => {
 });
 
 app.post('/api/folders', async (request, response) => {
-  const manager = requireRepoManager(response);
+  const manager = requireService(repoManager, response);
+  const user = await requireAuthenticatedUser(request, response);
 
-  if (!manager) {
+  if (!manager || !user) {
     return;
   }
 
@@ -276,7 +465,7 @@ app.post('/api/folders', async (request, response) => {
 
     response.status(201).json({
       ok: true,
-      ...(await manager.createFolder(repoAlias, parentPath, name)),
+      ...(await manager.createFolder(user.id, repoAlias, parentPath, name)),
     });
   } catch (error) {
     sendError(response, error, 400);
@@ -284,9 +473,10 @@ app.post('/api/folders', async (request, response) => {
 });
 
 app.delete('/api/folders', async (request, response) => {
-  const manager = requireRepoManager(response);
+  const manager = requireService(repoManager, response);
+  const user = await requireAuthenticatedUser(request, response);
 
-  if (!manager) {
+  if (!manager || !user) {
     return;
   }
 
@@ -301,7 +491,7 @@ app.delete('/api/folders', async (request, response) => {
 
     response.json({
       ok: true,
-      ...(await manager.deleteFolder(repoAlias, folderPath)),
+      ...(await manager.deleteFolder(user.id, repoAlias, folderPath)),
     });
   } catch (error) {
     sendError(response, error, 400);
@@ -309,9 +499,10 @@ app.delete('/api/folders', async (request, response) => {
 });
 
 app.post('/api/refresh', async (request, response) => {
-  const manager = requireRepoManager(response);
+  const manager = requireService(repoManager, response);
+  const user = await requireAuthenticatedUser(request, response);
 
-  if (!manager) {
+  if (!manager || !user) {
     return;
   }
 
@@ -324,7 +515,7 @@ app.post('/api/refresh', async (request, response) => {
 
     response.json({
       ok: true,
-      ...(await manager.refreshTree(repoAlias)),
+      ...(await manager.refreshTree(user.id, repoAlias)),
     });
   } catch (error) {
     sendError(response, error, 400);
@@ -332,9 +523,10 @@ app.post('/api/refresh', async (request, response) => {
 });
 
 app.post('/api/sync', async (request, response) => {
-  const manager = requireRepoManager(response);
+  const manager = requireService(repoManager, response);
+  const user = await requireAuthenticatedUser(request, response);
 
-  if (!manager) {
+  if (!manager || !user) {
     return;
   }
 
@@ -347,7 +539,7 @@ app.post('/api/sync', async (request, response) => {
 
     response.json({
       ok: true,
-      ...(await manager.syncNow(repoAlias, 'manual')),
+      ...(await manager.syncNow(user.id, repoAlias, 'manual')),
     });
   } catch (error) {
     sendError(response, error);
@@ -364,6 +556,10 @@ const server = app.listen(listenPort, '0.0.0.0', () => {
 async function shutdown() {
   if (syncTimer) {
     clearInterval(syncTimer);
+  }
+
+  if (sessionPruneTimer) {
+    clearInterval(sessionPruneTimer);
   }
 
   if (repoManager) {
