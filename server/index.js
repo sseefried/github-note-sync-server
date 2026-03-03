@@ -57,6 +57,33 @@ function isAllowedOrigin(origin, config) {
   }
 }
 
+function getForwardedProto(request) {
+  const forwardedProto = request.headers['x-forwarded-proto'];
+  const firstValue = Array.isArray(forwardedProto) ? forwardedProto[0] : forwardedProto;
+
+  return String(firstValue ?? '')
+    .split(',')[0]
+    .trim()
+    .toLowerCase();
+}
+
+app.use((request, response, next) => {
+  if (!serverConfig) {
+    next();
+    return;
+  }
+
+  if (getForwardedProto(request) !== 'https') {
+    response.status(400).json({
+      error:
+        'HTTPS is required. Send requests through the configured reverse proxy so it can forward X-Forwarded-Proto: https.',
+    });
+    return;
+  }
+
+  next();
+});
+
 app.use(
   cors({
     credentials: true,

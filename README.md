@@ -42,11 +42,11 @@ The server repository is the backend API and git-sync engine. It owns users, pas
 10. All server data lives under `$HOME/.local/github-note-sync-server`.
 11. Each sync attempt is logged to stdout with an ISO timestamp, the authenticated user id, and the `repoAlias`.
 
-For browser clients on another origin, set `allowedOrigins` in `config.json`. The bundled web client uses bearer tokens, so it does not depend on cross-site cookies. If you want HTTPS locally or in production, terminate TLS in a reverse proxy such as nginx or Caddy and proxy through to this HTTP server.
+The server now rejects requests that do not arrive with `X-Forwarded-Proto: https`. In practice that means you are expected to run it behind a reverse proxy such as Caddy or nginx in both local HTTPS testing and production. For browser clients on another origin, set `allowedOrigins` in `config.json`.
 
 ## Local HTTPS Testing
 
-Use Caddy to terminate TLS locally while keeping the server itself on HTTP.
+Use Caddy to terminate TLS locally while keeping the server itself on HTTP. This is required for normal browser use because direct requests to the server port are rejected unless the proxy forwards `X-Forwarded-Proto: https`.
 
 1. Install Caddy on macOS:
 
@@ -100,7 +100,7 @@ Use Caddy to terminate TLS locally while keeping the server itself on HTTP.
 
 7. Open the app at `https://notes.localhost`.
 
-In this setup, Caddy terminates HTTPS and proxies to the local HTTP dev servers, which keeps local transport aligned with a production reverse-proxy deployment.
+In this setup, Caddy terminates HTTPS, adds `X-Forwarded-Proto: https`, and proxies to the local HTTP dev servers. Direct requests to `http://127.0.0.1:3001` are expected to fail unless you manually send that header.
 
 ## Deployment
 
@@ -184,7 +184,7 @@ The server never returns private keys.
 
 ## Architecture
 
-The server is an Express API with two server-owned state layers: authentication and repo orchestration. Authentication stores users under `$HOME/.local/github-note-sync-server/users/<userId>/profile.json`, hashes passwords with Node's built-in `scrypt`, persists opaque sessions under `$HOME/.local/github-note-sync-server/sessions`, and resolves the authenticated user from either a session cookie or a bearer token on every request. Repo state is namespaced per user under `$HOME/.local/github-note-sync-server/users/<userId>/repos/<repoAlias>`, where each alias contains metadata, a clone directory, an SSH directory, and a small UI-state file. On startup the server loads optional local configuration, validates cookie/origin settings, verifies that `ssh-keygen` can successfully generate an ED25519 keypair, and deletes that startup-check keypair. The repo manager threads `userId` through every lookup so the same `repoAlias` can exist for multiple users without collision, and the Git layer still shells out with `GIT_SSH_COMMAND` pointed at the server-generated private key for that specific user-owned alias. Transport security is intentionally external: both local HTTPS testing and production deployments are expected to terminate TLS in a reverse proxy such as Caddy or nginx before forwarding requests to this HTTP service.
+The server is an Express API with two server-owned state layers: authentication and repo orchestration. Authentication stores users under `$HOME/.local/github-note-sync-server/users/<userId>/profile.json`, hashes passwords with Node's built-in `scrypt`, persists opaque sessions under `$HOME/.local/github-note-sync-server/sessions`, and resolves the authenticated user from either a session cookie or a bearer token on every request. Repo state is namespaced per user under `$HOME/.local/github-note-sync-server/users/<userId>/repos/<repoAlias>`, where each alias contains metadata, a clone directory, an SSH directory, and a small UI-state file. On startup the server loads optional local configuration, validates cookie/origin settings, verifies that `ssh-keygen` can successfully generate an ED25519 keypair, and deletes that startup-check keypair. A global request guard rejects any request that does not arrive with `X-Forwarded-Proto: https`, so the service is intended to sit behind a reverse proxy that terminates TLS and forwards that header. The repo manager threads `userId` through every lookup so the same `repoAlias` can exist for multiple users without collision, and the Git layer still shells out with `GIT_SSH_COMMAND` pointed at the server-generated private key for that specific user-owned alias. Transport security is intentionally external: both local HTTPS testing and production deployments are expected to terminate TLS in a reverse proxy such as Caddy or nginx before forwarding requests to this HTTP service.
 
 Design philosophy:
 
