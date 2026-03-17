@@ -30,6 +30,7 @@ function getAliasPaths(config, userId, repoAlias) {
     aliasDir,
     cloneDir: path.join(aliasDir, 'clone'),
     metadataPath: path.join(aliasDir, 'metadata.json'),
+    opsStatePath: path.join(aliasDir, 'ops-state.json'),
     privateKeyPath: path.join(sshDir, 'id_ed25519'),
     publicKeyPath: path.join(sshDir, 'id_ed25519.pub'),
     sshDir,
@@ -138,6 +139,7 @@ function buildRepoConfig(appConfig, userId, metadata) {
     repoAlias: metadata.repoAlias,
     repoDir: aliasPaths.cloneDir,
     repoLabel: getRepoLabel(metadata.repo),
+    opsStatePath: aliasPaths.opsStatePath,
     sshPrivateKeyPath: aliasPaths.privateKeyPath,
     syncIntervalMs: appConfig.syncIntervalMs,
     userId,
@@ -326,7 +328,11 @@ export class RepoManager {
       const service = await this.#ensureServiceReady(normalizedUserId, normalizedAlias, 'bootstrap');
 
       return {
+        conflictPaths: [],
+        headRevision: await service.getHeadRevision(),
+        mergeInProgress: false,
         ready: true,
+        stateRevision: service.getStatus().stateVersion,
         status: service.getStatus(),
         tree: await this.#listTreeWithUiState(normalizedUserId, normalizedAlias, service),
       };
@@ -342,7 +348,7 @@ export class RepoManager {
     const normalizedUserId = this.#normalizeUserId(userId);
     const normalizedAlias = this.#normalizeRepoAlias(repoAlias);
     const service = await this.#ensureServiceReady(normalizedUserId, normalizedAlias, 'read');
-    return service.readFile(relativePath);
+    return service.readFileState(relativePath);
   }
 
   async writeFile(userId, repoAlias, relativePath, content) {
@@ -351,6 +357,18 @@ export class RepoManager {
     const service = await this.#ensureServiceReady(normalizedUserId, normalizedAlias, 'write');
     await service.writeFile(relativePath, content);
     return service.getStatus();
+  }
+
+  async applyOps(userId, repoAlias, ops) {
+    const normalizedUserId = this.#normalizeUserId(userId);
+    const normalizedAlias = this.#normalizeRepoAlias(repoAlias);
+    const service = await this.#ensureServiceReady(normalizedUserId, normalizedAlias, 'apply ops');
+    const result = await service.applyOps(ops);
+
+    return {
+      ...result,
+      status: service.getStatus(),
+    };
   }
 
   async createFile(userId, repoAlias, relativePath) {

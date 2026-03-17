@@ -11,8 +11,14 @@ The server repository is the backend API and git-sync engine. It owns users, pas
    npm install
    ```
 
-3. Ensure `ssh-keygen` is installed and available in `PATH`.
-4. Optionally copy `config.json.example` to `config.json` and adjust auth, cookie, origin, sync, or commit settings.
+3. Run the automated tests:
+
+   ```bash
+   npm test
+   ```
+
+4. Ensure `ssh-keygen` is installed and available in `PATH`.
+5. Optionally copy `config.json.example` to `config.json` and adjust auth, cookie, origin, sync, or commit settings.
 
 ## Usage
 
@@ -172,9 +178,10 @@ Repo management and editing, all scoped to the authenticated user:
 - `PUT /api/repos/:repoAlias`: update the GitHub SSH repo URL for one alias
 - `DELETE /api/repos/:repoAlias`: delete one alias and remove its local server data
 - `GET /api/repos/:repoAlias/public-key`: return the public key for that alias
-- `GET /api/bootstrap?repoAlias=<alias>`: load the file tree and sync status for one repo alias
-- `GET /api/file?repoAlias=<alias>&path=<path>`: read a file
-- `PUT /api/file`: write a file for a repo alias
+- `GET /api/bootstrap?repoAlias=<alias>`: load the file tree, sync status, `headRevision`, `stateRevision`, `mergeInProgress`, and `conflictPaths` for one repo alias
+- `GET /api/file?repoAlias=<alias>&path=<path>`: read a file and return `{ content, path, revision }`
+- `POST /api/ops`: apply exactly one idempotent patch op for a repo alias, using `opId`, `baseRevision`, and ordered non-overlapping `replace` ranges in `payload.ops`
+- `PUT /api/file`: write a file for a repo alias as a compatibility fallback when a client cannot send a diff op
 - `POST /api/files`: create a file for a repo alias
 - `POST /api/folders`: create an empty UI folder for a repo alias
 - `DELETE /api/folders`: delete a folder that contains no files
@@ -185,7 +192,11 @@ The server never returns private keys.
 
 ## Architecture
 
-The server is an Express API with two server-owned state layers: authentication and repo orchestration. Authentication stores users under `$HOME/.local/github-note-sync-server/users/<userId>/profile.json`, hashes passwords with Node's built-in `scrypt`, persists opaque sessions under `$HOME/.local/github-note-sync-server/sessions`, and resolves the authenticated user from either a session cookie or a bearer token on every request. Repo state is namespaced per user under `$HOME/.local/github-note-sync-server/users/<userId>/repos/<repoAlias>`, where each alias contains metadata, a clone directory, an SSH directory, and a small UI-state file. On startup the server loads optional local configuration, validates cookie/origin settings, verifies that `ssh-keygen` can successfully generate an ED25519 keypair, and deletes that startup-check keypair. A global request guard rejects any request that does not arrive with `X-Forwarded-Proto: https`, so the service is intended to sit behind a reverse proxy that terminates TLS and forwards that header. The repo manager threads `userId` through every lookup so the same `repoAlias` can exist for multiple users without collision, and the Git layer still shells out with `GIT_SSH_COMMAND` pointed at the server-generated private key for that specific user-owned alias. Transport security is intentionally external: both local HTTPS testing and production deployments are expected to terminate TLS in a reverse proxy such as Caddy or nginx before forwarding requests to this HTTP service.
+The server is an Express API with two server-owned state layers: authentication and repo orchestration. Authentication stores users under `$HOME/.local/github-note-sync-server/users/<userId>/profile.json`, hashes passwords with Node's built-in `scrypt`, persists opaque sessions under `$HOME/.local/github-note-sync-server/sessions`, and resolves the authenticated user from either a session cookie or a bearer token on every request. Repo state is namespaced per user under `$HOME/.local/github-note-sync-server/users/<userId>/repos/<repoAlias>`, where each alias contains metadata, a clone directory, an SSH directory, a small UI-state file, and a durable `ops-state.json` file for recent patch-op receipts. On startup the server loads optional local configuration, validates cookie/origin settings, verifies that `ssh-keygen` can successfully generate an ED25519 keypair, and deletes that startup-check keypair. A global request guard rejects any request that does not arrive with `X-Forwarded-Proto: https`, so the service is intended to sit behind a reverse proxy that terminates TLS and forwards that header. The repo manager threads `userId` through every lookup so the same `repoAlias` can exist for multiple users without collision, and the Git layer still shells out with `GIT_SSH_COMMAND` pointed at the server-generated private key for that specific user-owned alias. Transport security is intentionally external: both local HTTPS testing and production deployments are expected to terminate TLS in a reverse proxy such as Caddy or nginx before forwarding requests to this HTTP service.
+
+The write API now has two layers. `GET /api/file` returns a content hash revision for each file, and `POST /api/ops` applies ordered range-replace patch ops against a `baseRevision`, records recent `opId` receipts for idempotent retry, and returns `409 conflict` with the server's current content when the base revision no longer matches. `PUT /api/file` remains available only as a compatibility fallback for older clients or older cached files that do not yet know a revision. The bootstrap payload now also exposes forward-compatible `headRevision`, `stateRevision`, `mergeInProgress`, and `conflictPaths` fields so the client can reason about sync state without another endpoint.
+
+This is still the protocol-first phase of the local-first redesign, not the final merge-aware sync architecture. The periodic sync loop still uses the existing remote-overwrite behavior when the remote changes, so the richer merge-marker and explicit conflict-resolution workflow from the design document has not landed yet. The new patch-op API and revision metadata are intended to be the stable contract that later merge-aware work builds on.
 
 Design philosophy:
 
@@ -193,7 +204,9 @@ Design philosophy:
 - Keep SSH private keys on the server and never expose them over the API.
 - Namespace aliases by user instead of assuming a global alias space.
 - Treat the remote repository as authoritative and make each local clone disposable.
+- Prefer idempotent diff-based patch ops for normal text edits, but keep whole-file writes as an explicit fallback during migration.
 - Accept editor keystroke-driven writes, but batch Git commits onto a sync interval to avoid noisy history.
+- Keep recent op receipts durable per alias so client retries are safe when requests or responses are lost.
 - Keep empty-folder UI affordances separate from Git by storing that state outside the repository clone.
 - Require explicit browser origin configuration once deployments move beyond local/private-network testing.
 - Keep TLS termination outside the app so local and production network topology stay aligned.

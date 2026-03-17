@@ -2,9 +2,18 @@ import { execFile } from 'node:child_process';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
+import { applyPatchOperations, hashContent } from './patch-ops.js';
 
 const execFileAsync = promisify(execFile);
 const MAX_BUFFER = 10 * 1024 * 1024;
+const MAX_DEDUPE_ENTRIES = 10_000;
+
+function createConflictError(payload) {
+  const error = new Error(payload.error ?? 'conflict');
+  error.statusCode = 409;
+  error.payload = payload;
+  return error;
+}
 
 function sortEntries(entries) {
   return [...entries].sort((left, right) => {
@@ -19,6 +28,9 @@ function sortEntries(entries) {
 export class GitRepoService {
   constructor(config) {
     this.config = config;
+    this.appliedOps = new Map();
+    this.appliedOpsLoaded = false;
+    this.appliedOpsOrder = [];
     this.branch = null;
     this.baseRemoteHead = null;
     this.stateVersion = 0;
@@ -32,10 +44,12 @@ export class GitRepoService {
 
   async ensureReady(reason = 'startup') {
     if (this.initialized && (await this.#hasClone())) {
+      await this.#loadAppliedOps();
       return;
     }
 
     await this.ensureFreshClone(reason);
+    await this.#loadAppliedOps();
     this.initialized = true;
   }
 
@@ -58,6 +72,11 @@ export class GitRepoService {
       tree: await this.listTree(),
       status: this.getStatus(),
     };
+  }
+
+  async getHeadRevision() {
+    await this.ensureReady('head revision');
+    return this.#git(['rev-parse', 'HEAD']);
   }
 
   getStatus() {
@@ -87,6 +106,15 @@ export class GitRepoService {
   async readFile(relativePath) {
     const absolutePath = this.#resolveRepoPath(relativePath);
     return fs.readFile(absolutePath, 'utf8');
+  }
+
+  async readFileState(relativePath) {
+    const content = await this.readFile(relativePath);
+    return {
+      content,
+      path: relativePath,
+      revision: hashContent(content),
+    };
   }
 
   async createFile(relativePath) {
@@ -120,6 +148,90 @@ export class GitRepoService {
     this.stateVersion += 1;
     this.lastSyncStatus = 'dirty';
     this.lastSyncMessage = `Unsynced edits in ${relativePath}.`;
+  }
+
+  async applyOps(ops) {
+    await this.#loadAppliedOps();
+
+    const normalizedOps = Array.isArray(ops) ? ops : [];
+    const ackedOpIds = [];
+    const outcomes = [];
+
+    for (const op of normalizedOps) {
+      if (this.appliedOps.has(op?.opId)) {
+        const appliedEntry = this.appliedOps.get(op.opId);
+
+        try {
+          const { revision: currentRevision } = await this.readFileState(appliedEntry.path);
+
+          if (currentRevision === appliedEntry.revision) {
+            ackedOpIds.push(op.opId);
+            outcomes.push({
+              opId: op.opId,
+              path: appliedEntry.path,
+              revision: appliedEntry.revision,
+              status: 'duplicate',
+            });
+            continue;
+          }
+        } catch {}
+      }
+
+      if (
+        typeof op?.opId !== 'string' ||
+        op.opId.trim() === '' ||
+        op.kind !== 'patch' ||
+        typeof op.path !== 'string' ||
+        typeof op.baseRevision !== 'string' ||
+        !Array.isArray(op.payload?.ops)
+      ) {
+        outcomes.push({
+          opId: typeof op?.opId === 'string' ? op.opId : null,
+          path: typeof op?.path === 'string' ? op.path : null,
+          status: 'invalid',
+        });
+        continue;
+      }
+
+      const { content: currentContent, revision: currentRevision } = await this.readFileState(op.path);
+
+      if (currentRevision !== op.baseRevision) {
+        throw createConflictError({
+          currentContent,
+          currentRevision,
+          error: 'conflict',
+          expectedBaseRevision: op.baseRevision,
+          path: op.path,
+          serverMergeState: {
+            conflictPaths: [],
+            mergeInProgress: false,
+          },
+        });
+      }
+
+      const nextContent = applyPatchOperations(currentContent, op.payload.ops);
+      await this.writeFile(op.path, nextContent);
+
+      const nextRevision = hashContent(nextContent);
+      await this.#recordAppliedOp(op.opId, {
+        path: op.path,
+        recordedAt: new Date().toISOString(),
+        revision: nextRevision,
+      });
+
+      ackedOpIds.push(op.opId);
+      outcomes.push({
+        opId: op.opId,
+        path: op.path,
+        revision: nextRevision,
+        status: 'applied',
+      });
+    }
+
+    return {
+      ackedOpIds,
+      outcomes,
+    };
   }
 
   async syncNow(reason = 'manual') {
@@ -196,6 +308,73 @@ export class GitRepoService {
         throw resetError;
       }
     }
+  }
+
+  async #loadAppliedOps() {
+    if (this.appliedOpsLoaded) {
+      return;
+    }
+
+    try {
+      const rawAppliedOps = await fs.readFile(this.config.opsStatePath, 'utf8');
+      const parsedAppliedOps = JSON.parse(rawAppliedOps);
+      const entries = Array.isArray(parsedAppliedOps?.entries) ? parsedAppliedOps.entries : [];
+
+      this.appliedOps = new Map();
+      this.appliedOpsOrder = [];
+
+      for (const entry of entries) {
+        if (
+          typeof entry?.opId !== 'string' ||
+          entry.opId.trim() === '' ||
+          typeof entry?.path !== 'string' ||
+          typeof entry?.revision !== 'string'
+        ) {
+          continue;
+        }
+
+        this.appliedOps.set(entry.opId, entry);
+        this.appliedOpsOrder.push(entry.opId);
+      }
+    } catch (error) {
+      if (error.code !== 'ENOENT') {
+        throw error;
+      }
+
+      this.appliedOps = new Map();
+      this.appliedOpsOrder = [];
+    }
+
+    this.appliedOpsLoaded = true;
+  }
+
+  async #recordAppliedOp(opId, entry) {
+    this.appliedOps.set(opId, {
+      opId,
+      ...entry,
+    });
+    this.appliedOpsOrder = [...this.appliedOpsOrder.filter((entryOpId) => entryOpId !== opId), opId];
+
+    while (this.appliedOpsOrder.length > MAX_DEDUPE_ENTRIES) {
+      const oldestOpId = this.appliedOpsOrder.shift();
+
+      if (oldestOpId) {
+        this.appliedOps.delete(oldestOpId);
+      }
+    }
+
+    await fs.mkdir(path.dirname(this.config.opsStatePath), { recursive: true });
+    await fs.writeFile(
+      this.config.opsStatePath,
+      `${JSON.stringify(
+        {
+          entries: this.appliedOpsOrder.map((entryOpId) => this.appliedOps.get(entryOpId)),
+        },
+        null,
+        2,
+      )}\n`,
+      'utf8',
+    );
   }
 
   async #hasClone() {

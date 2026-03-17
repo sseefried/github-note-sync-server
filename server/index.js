@@ -406,9 +406,45 @@ app.get('/api/file', async (request, response) => {
   try {
     const repoAlias = getRepoAliasFromRequest(request);
     const filePath = String(request.query.path ?? '');
-    const content = await manager.readFile(user.id, repoAlias, filePath);
-    response.json({ content, path: filePath });
+    response.json(await manager.readFile(user.id, repoAlias, filePath));
   } catch (error) {
+    sendError(response, error, 400);
+  }
+});
+
+app.post('/api/ops', async (request, response) => {
+  const manager = requireService(repoManager, response);
+  const user = await requireAuthenticatedUser(request, response);
+
+  if (!manager || !user) {
+    return;
+  }
+
+  try {
+    const { repoAlias, ops } = request.body ?? {};
+
+    if (typeof repoAlias !== 'string' || !Array.isArray(ops)) {
+      return response.status(400).json({
+        error: 'Request body must include a "repoAlias" string and an "ops" array.',
+      });
+    }
+
+    if (ops.length !== 1) {
+      return response.status(400).json({
+        error: 'This server currently accepts exactly one op per /api/ops request.',
+      });
+    }
+
+    response.json({
+      ok: true,
+      ...(await manager.applyOps(user.id, repoAlias, ops)),
+    });
+  } catch (error) {
+    if (error?.statusCode === 409 && error?.payload) {
+      response.status(409).json(error.payload);
+      return;
+    }
+
     sendError(response, error, 400);
   }
 });
