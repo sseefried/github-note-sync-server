@@ -462,18 +462,19 @@ app.post('/api/conflicts/commit-markers', async (request, response) => {
       repoAlias,
       path: filePath,
       baseContent,
+      forceFullConflict,
       localContent,
     } = request.body ?? {};
 
     if (
       typeof repoAlias !== 'string' ||
       typeof filePath !== 'string' ||
-      typeof baseContent !== 'string' ||
+      (typeof baseContent !== 'string' && forceFullConflict !== true) ||
       typeof localContent !== 'string'
     ) {
       return response.status(400).json({
         error:
-          'Request body must include "repoAlias", "path", "baseContent", and "localContent" strings.',
+          'Request body must include "repoAlias", "path", and "localContent" strings, plus "baseContent" unless "forceFullConflict" is true.',
       });
     }
 
@@ -481,6 +482,7 @@ app.post('/api/conflicts/commit-markers', async (request, response) => {
       ok: true,
       ...(await manager.commitConflictMarkers(user.id, repoAlias, {
         baseContent,
+        forceFullConflict: forceFullConflict === true,
         localContent,
         path: filePath,
       })),

@@ -173,3 +173,26 @@ test('commitConflictMarkers cleanly auto-merges non-overlapping edits without ma
   assert.match(result.file.content, /local first line/);
   assert.match(result.file.content, /remote third line/);
 });
+
+test('commitConflictMarkers can force a full conflict block when historical base text is missing', async (t) => {
+  const fixture = await createRepoFixture();
+  t.after(async () => {
+    await fixture.cleanup();
+  });
+
+  const { service } = fixture;
+  await service.writeFile('notes/today.md', 'remote version\n');
+  await service.syncNow('desktop update');
+
+  const result = await service.commitConflictMarkers({
+    forceFullConflict: true,
+    localContent: 'local version\n',
+    relativePath: 'notes/today.md',
+  });
+
+  assert.match(result.file.content, /^<<<<<<< notes\/today\.md \(local\)\n/);
+  assert.match(result.file.content, /\n=======\n/);
+  assert.match(result.file.content, /\n>>>>>>> notes\/today\.md \(remote\)\n$/);
+  assert.match(result.file.content, /local version/);
+  assert.match(result.file.content, /remote version/);
+});

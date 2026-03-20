@@ -235,15 +235,20 @@ export class GitRepoService {
     };
   }
 
-  async commitConflictMarkers({ baseContent, localContent, relativePath }) {
+  async commitConflictMarkers({
+    baseContent,
+    forceFullConflict = false,
+    localContent,
+    relativePath,
+  }) {
     if (
       typeof relativePath !== 'string' ||
       relativePath.trim() === '' ||
-      typeof baseContent !== 'string' ||
+      (!forceFullConflict && typeof baseContent !== 'string') ||
       typeof localContent !== 'string'
     ) {
       throw new Error(
-        'Conflict materialization requires "path", "baseContent", and "localContent" strings.',
+        'Conflict materialization requires "path" and "localContent" strings, plus "baseContent" unless "forceFullConflict" is true.',
       );
     }
 
@@ -261,12 +266,18 @@ export class GitRepoService {
 
     const normalizedPath = relativePath.replace(/\\/g, '/').replace(/^\/+/, '');
     const currentFileState = await this.readFileState(normalizedPath);
-    const mergedContent = await this.#createConflictMarkedContent({
-      baseContent,
-      currentContent: currentFileState.content,
-      localContent,
-      relativePath: normalizedPath,
-    });
+    const mergedContent = forceFullConflict
+      ? this.#createForcedConflictContent({
+          currentContent: currentFileState.content,
+          localContent,
+          relativePath: normalizedPath,
+        })
+      : await this.#createConflictMarkedContent({
+          baseContent,
+          currentContent: currentFileState.content,
+          localContent,
+          relativePath: normalizedPath,
+        });
 
     if (mergedContent === currentFileState.content) {
       this.lastSyncAt = new Date().toISOString();
@@ -549,6 +560,15 @@ export class GitRepoService {
     } finally {
       await fs.rm(tempDirectory, { force: true, recursive: true });
     }
+  }
+
+  #createForcedConflictContent({ currentContent, localContent, relativePath }) {
+    const normalizedLocalContent = localContent.endsWith('\n') ? localContent : `${localContent}\n`;
+    const normalizedCurrentContent = currentContent.endsWith('\n')
+      ? currentContent
+      : `${currentContent}\n`;
+
+    return `<<<<<<< ${relativePath} (local)\n${normalizedLocalContent}=======\n${normalizedCurrentContent}>>>>>>> ${relativePath} (remote)\n`;
   }
 
   async #walkDirectory(absoluteDirectory, relativeDirectory) {
