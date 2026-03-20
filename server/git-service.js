@@ -1,6 +1,5 @@
 import { execFile } from 'node:child_process';
 import fs from 'node:fs/promises';
-import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { applyPatchOperations, hashContent } from './patch-ops.js';
@@ -236,7 +235,7 @@ export class GitRepoService {
   }
 
   async commitConflictMarkers({
-    baseContent,
+    baseCommit,
     forceFullConflict = false,
     localContent,
     relativePath,
@@ -244,73 +243,170 @@ export class GitRepoService {
     if (
       typeof relativePath !== 'string' ||
       relativePath.trim() === '' ||
-      (!forceFullConflict && typeof baseContent !== 'string') ||
+      (!forceFullConflict && typeof baseCommit !== 'string') ||
       typeof localContent !== 'string'
     ) {
       throw new Error(
-        'Conflict materialization requires "path" and "localContent" strings, plus "baseContent" unless "forceFullConflict" is true.',
+        'Conflict materialization requires "path" and "localContent" strings, plus "baseCommit" unless "forceFullConflict" is true.',
       );
     }
 
     await this.ensureReady('conflict markers');
     await this.#git(['fetch', '--prune', 'origin']);
-
+    const normalizedPath = relativePath.replace(/\\/g, '/').replace(/^\/+/, '');
     const remoteHead = await this.#git(['rev-parse', `origin/${this.branch}`]);
-    const localHead = await this.#git(['rev-parse', 'HEAD']);
+    const statusOutput = await this.#git(['status', '--porcelain']);
 
-    if (remoteHead !== localHead) {
+    if (statusOutput.trim() !== '') {
       throw new Error(
-        `Remote changed on origin/${this.branch} before the conflict-marked merge could be created. Refresh and retry.`,
+        'Conflict materialization requires a clean server clone. Retry after pending server sync completes.',
       );
     }
 
-    const normalizedPath = relativePath.replace(/\\/g, '/').replace(/^\/+/, '');
-    const currentFileState = await this.readFileState(normalizedPath);
-    const mergedContent = forceFullConflict
-      ? this.#createForcedConflictContent({
-          currentContent: currentFileState.content,
-          localContent,
-          relativePath: normalizedPath,
-        })
-      : await this.#createConflictMarkedContent({
-          baseContent,
-          currentContent: currentFileState.content,
-          localContent,
-          relativePath: normalizedPath,
-        });
+    await this.#git(['checkout', '-B', this.branch, `origin/${this.branch}`]);
+    await this.#git(['reset', '--hard', `origin/${this.branch}`]);
+    await this.#git(['clean', '-fd']);
 
-    if (mergedContent === currentFileState.content) {
+    const currentHead = await this.#git(['rev-parse', 'HEAD']);
+
+    if (forceFullConflict) {
+      const currentFileState = await this.readFileState(normalizedPath);
+      const mergedContent = this.#createForcedConflictContent({
+        currentContent: currentFileState.content,
+        localContent,
+        relativePath: normalizedPath,
+      });
+
+      if (mergedContent === currentFileState.content) {
+        this.lastSyncAt = new Date().toISOString();
+        this.lastSyncStatus = 'pushed';
+        this.lastSyncMessage = `Conflict-marked merge for ${normalizedPath} already matches the server clone.`;
+        this.stateVersion += 1;
+
+        return {
+          file: currentFileState,
+        };
+      }
+
+      await this.writeFile(normalizedPath, mergedContent);
+      await this.#git(['add', '-A']);
+      await this.#git([
+        'commit',
+        '-m',
+        `Conflict-marked merge for ${normalizedPath} (${new Date().toISOString()})`,
+      ]);
+      await this.#git(['push', 'origin', `HEAD:${this.branch}`]);
+
+      const nextFileState = await this.readFileState(normalizedPath);
+
+      this.baseRemoteHead = await this.#git(['rev-parse', 'HEAD']);
+      this.dirtyPaths.clear();
       this.lastSyncAt = new Date().toISOString();
       this.lastSyncStatus = 'pushed';
-      this.lastSyncMessage = `Conflict-marked merge for ${normalizedPath} already matches the server clone.`;
+      this.lastSyncMessage = `Committed conflict-marked merge for ${normalizedPath}.`;
       this.stateVersion += 1;
 
       return {
-        file: currentFileState,
+        file: nextFileState,
       };
     }
 
-    await this.writeFile(normalizedPath, mergedContent);
-    await this.#git(['add', '-A']);
-    await this.#git([
-      'commit',
-      '-m',
-      `Conflict-marked merge for ${normalizedPath} (${new Date().toISOString()})`,
-    ]);
-    await this.#git(['push', 'origin', `HEAD:${this.branch}`]);
+    await this.#git(['rev-parse', '--verify', `${baseCommit}^{commit}`]);
 
-    const nextFileState = await this.readFileState(normalizedPath);
+    const temporaryBranch = this.#makeTemporaryBranchName();
+    let succeeded = false;
 
-    this.baseRemoteHead = await this.#git(['rev-parse', 'HEAD']);
-    this.dirtyPaths.clear();
-    this.lastSyncAt = new Date().toISOString();
-    this.lastSyncStatus = 'pushed';
-    this.lastSyncMessage = `Committed conflict-marked merge for ${normalizedPath}.`;
-    this.stateVersion += 1;
+    try {
+      await this.#git(['checkout', '-B', temporaryBranch, baseCommit]);
 
-    return {
-      file: nextFileState,
-    };
+      const absolutePath = this.#resolveRepoPath(normalizedPath);
+      await fs.mkdir(path.dirname(absolutePath), { recursive: true });
+      await fs.writeFile(absolutePath, localContent, 'utf8');
+      await this.#git(['add', '-A']);
+
+      const temporaryStatus = await this.#git(['status', '--porcelain']);
+      let localCommit = baseCommit;
+
+      if (temporaryStatus.trim() !== '') {
+        await this.#git([
+          'commit',
+          '-m',
+          `Temporary local conflict source for ${normalizedPath} (${new Date().toISOString()})`,
+        ]);
+        localCommit = await this.#git(['rev-parse', 'HEAD']);
+      }
+
+      let mergeCreatedConflictMarkers = false;
+
+      try {
+        await this.#git(['merge', '--no-commit', '--no-ff', currentHead]);
+      } catch (error) {
+        if (!(await this.#hasMergeHead())) {
+          throw error;
+        }
+
+        mergeCreatedConflictMarkers = true;
+      }
+
+      const mergeStatus = await this.#git(['status', '--porcelain']);
+
+      if (mergeStatus.trim() === '') {
+        const currentFileState = await this.readFileState(normalizedPath);
+        this.lastSyncAt = new Date().toISOString();
+        this.lastSyncStatus = 'pushed';
+        this.lastSyncMessage = `Conflict-marked merge for ${normalizedPath} already matches origin/${this.branch}.`;
+        this.stateVersion += 1;
+        succeeded = true;
+        return {
+          file: currentFileState,
+        };
+      }
+
+      await this.#git(['add', '-A']);
+      await this.#git([
+        'commit',
+        '-m',
+        `${mergeCreatedConflictMarkers ? 'Conflict-marked' : 'Merged'} client changes for ${normalizedPath} (${new Date().toISOString()})`,
+      ]);
+      await this.#git(['push', 'origin', `HEAD:${this.branch}`]);
+      await this.#git(['checkout', '-B', this.branch, 'HEAD']);
+
+      const nextFileState = await this.readFileState(normalizedPath);
+
+      this.baseRemoteHead = await this.#git(['rev-parse', 'HEAD']);
+      this.dirtyPaths.clear();
+      this.lastSyncAt = new Date().toISOString();
+      this.lastSyncStatus = 'pushed';
+      this.lastSyncMessage = `${mergeCreatedConflictMarkers ? 'Committed conflict-marked merge' : 'Merged client changes'} for ${normalizedPath}.`;
+      this.stateVersion += 1;
+      succeeded = true;
+
+      return {
+        file: nextFileState,
+      };
+    } finally {
+      if (!succeeded) {
+        try {
+          if (await this.#hasMergeHead()) {
+            await this.#git(['merge', '--abort']);
+          }
+        } catch {}
+
+        try {
+          await this.#git(['checkout', '-B', this.branch, currentHead]);
+          await this.#git(['reset', '--hard', currentHead]);
+          await this.#git(['clean', '-fd']);
+        } catch {}
+      }
+
+      try {
+        await this.#git(['branch', '-D', temporaryBranch]);
+      } catch {}
+
+      if (!succeeded) {
+        this.baseRemoteHead = remoteHead;
+      }
+    }
   }
 
   async syncNow(reason = 'manual') {
@@ -507,61 +603,6 @@ export class GitRepoService {
     this.stateVersion += 1;
   }
 
-  async #createConflictMarkedContent({
-    baseContent,
-    currentContent,
-    localContent,
-    relativePath,
-  }) {
-    const tempDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'github-note-sync-merge-'));
-    const localFilePath = path.join(tempDirectory, 'local.txt');
-    const baseFilePath = path.join(tempDirectory, 'base.txt');
-    const remoteFilePath = path.join(tempDirectory, 'remote.txt');
-
-    await Promise.all([
-      fs.writeFile(localFilePath, localContent, 'utf8'),
-      fs.writeFile(baseFilePath, baseContent, 'utf8'),
-      fs.writeFile(remoteFilePath, currentContent, 'utf8'),
-    ]);
-
-    try {
-      const result = await execFileAsync(
-        'git',
-        [
-          'merge-file',
-          '-p',
-          '-L',
-          `${relativePath} (local)`,
-          '-L',
-          `${relativePath} (base)`,
-          '-L',
-          `${relativePath} (remote)`,
-          localFilePath,
-          baseFilePath,
-          remoteFilePath,
-        ],
-        {
-          cwd: this.config.repoDir,
-          env: process.env,
-          maxBuffer: MAX_BUFFER,
-        },
-      );
-
-      return result.stdout;
-    } catch (error) {
-      const stdout = error.stdout?.toString() ?? '';
-
-      if (stdout !== '' && Number.isInteger(error.code) && error.code >= 1) {
-        return stdout;
-      }
-
-      const stderr = error.stderr?.toString().trim();
-      throw new Error(`git merge-file failed: ${stderr || error.message}`);
-    } finally {
-      await fs.rm(tempDirectory, { force: true, recursive: true });
-    }
-  }
-
   #createForcedConflictContent({ currentContent, localContent, relativePath }) {
     const normalizedLocalContent = localContent.endsWith('\n') ? localContent : `${localContent}\n`;
     const normalizedCurrentContent = currentContent.endsWith('\n')
@@ -569,6 +610,19 @@ export class GitRepoService {
       : `${currentContent}\n`;
 
     return `<<<<<<< ${relativePath} (local)\n${normalizedLocalContent}=======\n${normalizedCurrentContent}>>>>>>> ${relativePath} (remote)\n`;
+  }
+
+  async #hasMergeHead() {
+    try {
+      await fs.access(path.join(this.config.repoDir, '.git', 'MERGE_HEAD'));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  #makeTemporaryBranchName() {
+    return `github-note-sync-temp-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
   }
 
   async #walkDirectory(absoluteDirectory, relativeDirectory) {
