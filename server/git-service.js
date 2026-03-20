@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process';
 import fs from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { applyPatchOperations, hashContent } from './patch-ops.js';
@@ -234,6 +235,73 @@ export class GitRepoService {
     };
   }
 
+  async commitConflictMarkers({ baseContent, localContent, relativePath }) {
+    if (
+      typeof relativePath !== 'string' ||
+      relativePath.trim() === '' ||
+      typeof baseContent !== 'string' ||
+      typeof localContent !== 'string'
+    ) {
+      throw new Error(
+        'Conflict materialization requires "path", "baseContent", and "localContent" strings.',
+      );
+    }
+
+    await this.ensureReady('conflict markers');
+    await this.#git(['fetch', '--prune', 'origin']);
+
+    const remoteHead = await this.#git(['rev-parse', `origin/${this.branch}`]);
+    const localHead = await this.#git(['rev-parse', 'HEAD']);
+
+    if (remoteHead !== localHead) {
+      throw new Error(
+        `Remote changed on origin/${this.branch} before the conflict-marked merge could be created. Refresh and retry.`,
+      );
+    }
+
+    const normalizedPath = relativePath.replace(/\\/g, '/').replace(/^\/+/, '');
+    const currentFileState = await this.readFileState(normalizedPath);
+    const mergedContent = await this.#createConflictMarkedContent({
+      baseContent,
+      currentContent: currentFileState.content,
+      localContent,
+      relativePath: normalizedPath,
+    });
+
+    if (mergedContent === currentFileState.content) {
+      this.lastSyncAt = new Date().toISOString();
+      this.lastSyncStatus = 'pushed';
+      this.lastSyncMessage = `Conflict-marked merge for ${normalizedPath} already matches the server clone.`;
+      this.stateVersion += 1;
+
+      return {
+        file: currentFileState,
+      };
+    }
+
+    await this.writeFile(normalizedPath, mergedContent);
+    await this.#git(['add', '-A']);
+    await this.#git([
+      'commit',
+      '-m',
+      `Conflict-marked merge for ${normalizedPath} (${new Date().toISOString()})`,
+    ]);
+    await this.#git(['push', 'origin', `HEAD:${this.branch}`]);
+
+    const nextFileState = await this.readFileState(normalizedPath);
+
+    this.baseRemoteHead = await this.#git(['rev-parse', 'HEAD']);
+    this.dirtyPaths.clear();
+    this.lastSyncAt = new Date().toISOString();
+    this.lastSyncStatus = 'pushed';
+    this.lastSyncMessage = `Committed conflict-marked merge for ${normalizedPath}.`;
+    this.stateVersion += 1;
+
+    return {
+      file: nextFileState,
+    };
+  }
+
   async syncNow(reason = 'manual') {
     await this.ensureReady(reason);
 
@@ -426,6 +494,61 @@ export class GitRepoService {
     this.lastSyncStatus = 'ready';
     this.lastSyncMessage = message;
     this.stateVersion += 1;
+  }
+
+  async #createConflictMarkedContent({
+    baseContent,
+    currentContent,
+    localContent,
+    relativePath,
+  }) {
+    const tempDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'github-note-sync-merge-'));
+    const localFilePath = path.join(tempDirectory, 'local.txt');
+    const baseFilePath = path.join(tempDirectory, 'base.txt');
+    const remoteFilePath = path.join(tempDirectory, 'remote.txt');
+
+    await Promise.all([
+      fs.writeFile(localFilePath, localContent, 'utf8'),
+      fs.writeFile(baseFilePath, baseContent, 'utf8'),
+      fs.writeFile(remoteFilePath, currentContent, 'utf8'),
+    ]);
+
+    try {
+      const result = await execFileAsync(
+        'git',
+        [
+          'merge-file',
+          '-p',
+          '-L',
+          `${relativePath} (local)`,
+          '-L',
+          `${relativePath} (base)`,
+          '-L',
+          `${relativePath} (remote)`,
+          localFilePath,
+          baseFilePath,
+          remoteFilePath,
+        ],
+        {
+          cwd: this.config.repoDir,
+          env: process.env,
+          maxBuffer: MAX_BUFFER,
+        },
+      );
+
+      return result.stdout;
+    } catch (error) {
+      const stdout = error.stdout?.toString() ?? '';
+
+      if (stdout !== '' && Number.isInteger(error.code) && error.code >= 1) {
+        return stdout;
+      }
+
+      const stderr = error.stderr?.toString().trim();
+      throw new Error(`git merge-file failed: ${stderr || error.message}`);
+    } finally {
+      await fs.rm(tempDirectory, { force: true, recursive: true });
+    }
   }
 
   async #walkDirectory(absoluteDirectory, relativeDirectory) {

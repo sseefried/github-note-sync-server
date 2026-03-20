@@ -371,6 +371,26 @@ export class RepoManager {
     };
   }
 
+  async commitConflictMarkers(userId, repoAlias, { baseContent, localContent, path: relativePath }) {
+    const normalizedUserId = this.#normalizeUserId(userId);
+    const normalizedAlias = this.#normalizeRepoAlias(repoAlias);
+    const service = await this.#ensureServiceReady(
+      normalizedUserId,
+      normalizedAlias,
+      'commit conflict markers',
+    );
+    const result = await service.commitConflictMarkers({
+      baseContent,
+      localContent,
+      relativePath,
+    });
+
+    return {
+      ...result,
+      status: service.getStatus(),
+    };
+  }
+
   async createFile(userId, repoAlias, relativePath) {
     const normalizedUserId = this.#normalizeUserId(userId);
     const normalizedAlias = this.#normalizeRepoAlias(repoAlias);

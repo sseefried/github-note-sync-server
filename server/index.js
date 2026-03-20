@@ -449,6 +449,47 @@ app.post('/api/ops', async (request, response) => {
   }
 });
 
+app.post('/api/conflicts/commit-markers', async (request, response) => {
+  const manager = requireService(repoManager, response);
+  const user = await requireAuthenticatedUser(request, response);
+
+  if (!manager || !user) {
+    return;
+  }
+
+  try {
+    const {
+      repoAlias,
+      path: filePath,
+      baseContent,
+      localContent,
+    } = request.body ?? {};
+
+    if (
+      typeof repoAlias !== 'string' ||
+      typeof filePath !== 'string' ||
+      typeof baseContent !== 'string' ||
+      typeof localContent !== 'string'
+    ) {
+      return response.status(400).json({
+        error:
+          'Request body must include "repoAlias", "path", "baseContent", and "localContent" strings.',
+      });
+    }
+
+    response.json({
+      ok: true,
+      ...(await manager.commitConflictMarkers(user.id, repoAlias, {
+        baseContent,
+        localContent,
+        path: filePath,
+      })),
+    });
+  } catch (error) {
+    sendError(response, error, 400);
+  }
+});
+
 app.put('/api/file', async (request, response) => {
   const manager = requireService(repoManager, response);
   const user = await requireAuthenticatedUser(request, response);

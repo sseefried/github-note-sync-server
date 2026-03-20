@@ -47,6 +47,7 @@ The server repository is the backend API and git-sync engine. It owns users, pas
 9. Fetch the public key from `GET /api/repos/:repoAlias/public-key` and add it to GitHub so the server can clone and push for that user-owned alias.
 10. All server data lives under `$HOME/.local/github-note-sync-server`.
 11. Each sync attempt is logged to stdout with an ISO timestamp, the authenticated user id, and the `repoAlias`.
+12. Normal text edits should arrive through `POST /api/ops`. When a client hits a revision conflict and the user explicitly confirms the no-loss merge path, the client sends whole-file `baseContent` and `localContent` to `POST /api/conflicts/commit-markers`, and the server commits the 3-way merged text as ordinary repo content.
 
 The server now rejects requests that do not arrive with `X-Forwarded-Proto: https`. In practice that means you are expected to run it behind a reverse proxy such as Caddy or nginx in both local HTTPS testing and production. For browser clients on another origin, set `allowedOrigins` in `config.json`.
 
@@ -181,6 +182,7 @@ Repo management and editing, all scoped to the authenticated user:
 - `GET /api/bootstrap?repoAlias=<alias>`: load the file tree, sync status, `headRevision`, `stateRevision`, `mergeInProgress`, and `conflictPaths` for one repo alias
 - `GET /api/file?repoAlias=<alias>&path=<path>`: read a file and return `{ content, path, revision }`
 - `POST /api/ops`: apply exactly one idempotent patch op for a repo alias, using `opId`, `baseRevision`, and ordered non-overlapping `replace` ranges in `payload.ops`
+- `POST /api/conflicts/commit-markers`: after explicit client acknowledgement, accept whole-file `baseContent` and `localContent`, 3-way merge them against the server's current file text, and commit the merged result as ordinary content
 - `PUT /api/file`: write a file for a repo alias as a compatibility fallback when a client cannot send a diff op
 - `POST /api/files`: create a file for a repo alias
 - `POST /api/folders`: create an empty UI folder for a repo alias
@@ -194,9 +196,9 @@ The server never returns private keys.
 
 The server is an Express API with two server-owned state layers: authentication and repo orchestration. Authentication stores users under `$HOME/.local/github-note-sync-server/users/<userId>/profile.json`, hashes passwords with Node's built-in `scrypt`, persists opaque sessions under `$HOME/.local/github-note-sync-server/sessions`, and resolves the authenticated user from either a session cookie or a bearer token on every request. Repo state is namespaced per user under `$HOME/.local/github-note-sync-server/users/<userId>/repos/<repoAlias>`, where each alias contains metadata, a clone directory, an SSH directory, a small UI-state file, and a durable `ops-state.json` file for recent patch-op receipts. On startup the server loads optional local configuration, validates cookie/origin settings, verifies that `ssh-keygen` can successfully generate an ED25519 keypair, and deletes that startup-check keypair. A global request guard rejects any request that does not arrive with `X-Forwarded-Proto: https`, so the service is intended to sit behind a reverse proxy that terminates TLS and forwards that header. The repo manager threads `userId` through every lookup so the same `repoAlias` can exist for multiple users without collision, and the Git layer still shells out with `GIT_SSH_COMMAND` pointed at the server-generated private key for that specific user-owned alias. Transport security is intentionally external: both local HTTPS testing and production deployments are expected to terminate TLS in a reverse proxy such as Caddy or nginx before forwarding requests to this HTTP service.
 
-The write API now has two layers. `GET /api/file` returns a content hash revision for each file, and `POST /api/ops` applies ordered range-replace patch ops against a `baseRevision`, records recent `opId` receipts for idempotent retry, and returns `409 conflict` with the server's current content when the base revision no longer matches. `PUT /api/file` remains available only as a compatibility fallback for older clients or older cached files that do not yet know a revision. The bootstrap payload now also exposes forward-compatible `headRevision`, `stateRevision`, `mergeInProgress`, and `conflictPaths` fields so the client can reason about sync state without another endpoint.
+The write API now has two explicit paths. `GET /api/file` returns a content hash revision for each file, and `POST /api/ops` applies ordered range-replace patch ops against a `baseRevision`, records recent `opId` receipts for idempotent retry, and returns `409 conflict` with the server's current content when the base revision no longer matches. When the client later receives explicit user acknowledgement for that conflict, `POST /api/conflicts/commit-markers` accepts whole-file `baseContent` and `localContent`, runs a 3-way merge against the server's current file text with `git merge-file -p`, and commits the result as ordinary repo content. `PUT /api/file` remains available only as a compatibility fallback for older clients or older cached files that do not yet know a revision. The bootstrap payload now also exposes forward-compatible `headRevision`, `stateRevision`, `mergeInProgress`, and `conflictPaths` fields so the client can reason about sync state without another endpoint.
 
-This is still the protocol-first phase of the local-first redesign, not the final merge-aware sync architecture. The periodic sync loop still uses the existing remote-overwrite behavior when the remote changes, so the richer merge-marker and explicit conflict-resolution workflow from the design document has not landed yet. The new patch-op API and revision metadata are intended to be the stable contract that later merge-aware work builds on.
+This is still not the final fully hardened sync architecture, because the periodic sync loop elsewhere in the server still has older remote-overwrite behavior in some paths. But explicit client-confirmed conflicts now follow the stricter no-loss policy: keep diff ops for normal editing, and switch to whole-file 3-way merge input only when a stale diff must be materialized into committed conflict-marked text.
 
 Design philosophy:
 
@@ -204,9 +206,10 @@ Design philosophy:
 - Keep SSH private keys on the server and never expose them over the API.
 - Namespace aliases by user instead of assuming a global alias space.
 - Treat the remote repository as authoritative and make each local clone disposable.
-- Prefer idempotent diff-based patch ops for normal text edits, but keep whole-file writes as an explicit fallback during migration.
+- Prefer idempotent diff-based patch ops for normal text edits, but switch to whole-file 3-way merge input for the explicit conflict-confirmation path and keep `PUT /api/file` only as an explicit migration fallback.
 - Accept editor keystroke-driven writes, but batch Git commits onto a sync interval to avoid noisy history.
 - Keep recent op receipts durable per alias so client retries are safe when requests or responses are lost.
+- When conflicts occur, preserve both sides by committing Git-style conflict markers as ordinary text instead of leaving hidden merge state for the client to manage.
 - Keep empty-folder UI affordances separate from Git by storing that state outside the repository clone.
 - Require explicit browser origin configuration once deployments move beyond local/private-network testing.
 - Keep TLS termination outside the app so local and production network topology stay aligned.

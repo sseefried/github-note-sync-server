@@ -54,6 +54,7 @@ async function createRepoFixture() {
       await service.dispose();
       await fs.rm(tempRoot, { force: true, recursive: true });
     },
+    remoteDir,
     service,
   };
 }
@@ -117,4 +118,58 @@ test('applyOps applies patches, detects true duplicates, and surfaces revision c
       return true;
     },
   );
+});
+
+test('commitConflictMarkers creates and pushes an ordinary commit with git conflict markers', async (t) => {
+  const fixture = await createRepoFixture();
+  t.after(async () => {
+    await fixture.cleanup();
+  });
+
+  const { remoteDir, service } = fixture;
+  const initialFileState = await service.readFileState('notes/today.md');
+
+  await service.writeFile('notes/today.md', 'desktop line\n');
+  await service.syncNow('desktop update');
+
+  const result = await service.commitConflictMarkers({
+    baseContent: initialFileState.content,
+    localContent: 'mobile line\n',
+    relativePath: 'notes/today.md',
+  });
+
+  assert.equal(result.file.path, 'notes/today.md');
+  assert.match(result.file.content, /<<<<<<< notes\/today\.md \(local\)/);
+  assert.match(result.file.content, /mobile line/);
+  assert.match(result.file.content, /desktop line/);
+  assert.match(result.file.content, />>>>>>> notes\/today\.md \(remote\)/);
+
+  const remoteContent = runGit(['show', 'main:notes/today.md'], remoteDir);
+  assert.equal(remoteContent, result.file.content.trimEnd());
+});
+
+test('commitConflictMarkers cleanly auto-merges non-overlapping edits without markers', async (t) => {
+  const fixture = await createRepoFixture();
+  t.after(async () => {
+    await fixture.cleanup();
+  });
+
+  const { service } = fixture;
+  await service.writeFile('notes/today.md', 'first line\nsecond line\nthird line\n');
+  await service.syncNow('prepare multi-line base');
+
+  const baseFileState = await service.readFileState('notes/today.md');
+
+  await service.writeFile('notes/today.md', 'first line\nsecond line\nremote third line\n');
+  await service.syncNow('desktop update');
+
+  const result = await service.commitConflictMarkers({
+    baseContent: baseFileState.content,
+    localContent: 'local first line\nsecond line\nthird line\n',
+    relativePath: 'notes/today.md',
+  });
+
+  assert.doesNotMatch(result.file.content, /<<<<<<<|=======|>>>>>>>/);
+  assert.match(result.file.content, /local first line/);
+  assert.match(result.file.content, /remote third line/);
 });
