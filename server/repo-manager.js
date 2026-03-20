@@ -351,17 +351,6 @@ export class RepoManager {
     return service.readFileState(relativePath);
   }
 
-  async writeFile(userId, repoAlias, relativePath, content) {
-    const normalizedUserId = this.#normalizeUserId(userId);
-    const normalizedAlias = this.#normalizeRepoAlias(repoAlias);
-    const service = await this.#ensureServiceReady(normalizedUserId, normalizedAlias, 'write');
-    await service.writeFile(relativePath, content);
-    return {
-      headRevision: await service.getHeadRevision(),
-      status: service.getStatus(),
-    };
-  }
-
   async applyOps(userId, repoAlias, ops) {
     const normalizedUserId = this.#normalizeUserId(userId);
     const normalizedAlias = this.#normalizeRepoAlias(repoAlias);

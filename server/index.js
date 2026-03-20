@@ -490,36 +490,6 @@ app.post('/api/conflicts/commit-markers', async (request, response) => {
   }
 });
 
-app.put('/api/file', async (request, response) => {
-  const manager = requireService(repoManager, response);
-  const user = await requireAuthenticatedUser(request, response);
-
-  if (!manager || !user) {
-    return;
-  }
-
-  try {
-    const { repoAlias, path: filePath, content } = request.body ?? {};
-
-    if (
-      typeof repoAlias !== 'string' ||
-      typeof filePath !== 'string' ||
-      typeof content !== 'string'
-    ) {
-      return response.status(400).json({
-        error: 'Request body must include "repoAlias", "path", and "content" strings.',
-      });
-    }
-
-    response.json({
-      ok: true,
-      ...(await manager.writeFile(user.id, repoAlias, filePath, content)),
-    });
-  } catch (error) {
-    sendError(response, error, 400);
-  }
-});
-
 app.post('/api/files', async (request, response) => {
   const manager = requireService(repoManager, response);
   const user = await requireAuthenticatedUser(request, response);
