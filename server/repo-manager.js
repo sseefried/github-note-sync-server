@@ -374,7 +374,7 @@ export class RepoManager {
   async commitConflictMarkers(
     userId,
     repoAlias,
-    { baseCommit, forceFullConflict, localContent, path: relativePath },
+    { baseCommit, localContent, path: relativePath },
   ) {
     const normalizedUserId = this.#normalizeUserId(userId);
     const normalizedAlias = this.#normalizeRepoAlias(repoAlias);
@@ -385,7 +385,6 @@ export class RepoManager {
     );
     const result = await service.commitConflictMarkers({
       baseCommit,
-      forceFullConflict,
       localContent,
       relativePath,
     });
