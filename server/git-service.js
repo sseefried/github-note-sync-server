@@ -314,7 +314,10 @@ export class GitRepoService {
       const mergeStatus = await this.#git(['status', '--porcelain']);
 
       if (mergeStatus.trim() === '') {
+        await this.#git(['checkout', '-B', this.branch, currentHead]);
         const currentFileState = await this.readFileState(normalizedPath);
+        this.baseRemoteHead = currentHead;
+        this.dirtyPaths.clear();
         this.lastSyncAt = new Date().toISOString();
         this.lastSyncStatus = 'pushed';
         this.lastSyncMessage = `Conflict-marked merge for ${normalizedPath} already matches origin/${this.branch}.`;

@@ -513,7 +513,7 @@ app.put('/api/file', async (request, response) => {
 
     response.json({
       ok: true,
-      status: await manager.writeFile(user.id, repoAlias, filePath, content),
+      ...(await manager.writeFile(user.id, repoAlias, filePath, content)),
     });
   } catch (error) {
     sendError(response, error, 400);

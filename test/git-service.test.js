@@ -175,6 +175,35 @@ test('commitConflictMarkers cleanly auto-merges non-overlapping edits without ma
   assert.match(result.file.content, /remote third line/);
 });
 
+test('commitConflictMarkers keeps the clone on main when the merge result already matches HEAD', async (t) => {
+  const fixture = await createRepoFixture();
+  t.after(async () => {
+    await fixture.cleanup();
+  });
+
+  const { remoteDir, service } = fixture;
+  const baseCommit = await service.getHeadRevision();
+
+  await service.writeFile('notes/today.md', 'already on main\n');
+  await service.syncNow('desktop update');
+
+  const expectedHead = runGit(['rev-parse', 'main'], remoteDir);
+
+  const result = await service.commitConflictMarkers({
+    baseCommit,
+    localContent: 'already on main\n',
+    relativePath: 'notes/today.md',
+  });
+
+  assert.equal(result.file.content, 'already on main\n');
+  assert.equal(await service.getHeadRevision(), expectedHead);
+  assert.equal(
+    runGit(['symbolic-ref', '--short', 'HEAD'], fixture.service.config.repoDir),
+    'main',
+  );
+  assert.doesNotMatch(runGit(['branch', '--list'], fixture.service.config.repoDir), /github-note-sync-temp-/);
+});
+
 test('commitConflictMarkers rejects requests without a base commit', async (t) => {
   const fixture = await createRepoFixture();
   t.after(async () => {
