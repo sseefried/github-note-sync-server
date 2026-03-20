@@ -356,7 +356,10 @@ export class RepoManager {
     const normalizedAlias = this.#normalizeRepoAlias(repoAlias);
     const service = await this.#ensureServiceReady(normalizedUserId, normalizedAlias, 'write');
     await service.writeFile(relativePath, content);
-    return service.getStatus();
+    return {
+      headRevision: await service.getHeadRevision(),
+      status: service.getStatus(),
+    };
   }
 
   async applyOps(userId, repoAlias, ops) {
@@ -367,6 +370,7 @@ export class RepoManager {
 
     return {
       ...result,
+      headRevision: await service.getHeadRevision(),
       status: service.getStatus(),
     };
   }
@@ -391,6 +395,7 @@ export class RepoManager {
 
     return {
       ...result,
+      headRevision: await service.getHeadRevision(),
       status: service.getStatus(),
     };
   }
