@@ -268,7 +268,15 @@ export class GitRepoService {
 
     const currentHead = await this.#git(['rev-parse', 'HEAD']);
 
-    await this.#git(['rev-parse', '--verify', `${baseCommit}^{commit}`]);
+    try {
+      await this.#git(['rev-parse', '--verify', `${baseCommit}^{commit}`]);
+    } catch {
+      const error = new Error(
+        `Base commit ${baseCommit} is no longer available on the server.`,
+      );
+      error.statusCode = 409;
+      throw error;
+    }
 
     const temporaryBranch = this.#makeTemporaryBranchName();
     let succeeded = false;

@@ -189,6 +189,6 @@ test('commitConflictMarkers rejects requests without a base commit', async (t) =
         localContent: 'local version\n',
         relativePath: 'notes/today.md',
       }),
-    /baseCommit/,
+    /baseCommit|base commit/i,
   );
 });
