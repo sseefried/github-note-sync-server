@@ -196,11 +196,13 @@ export class GitRepoService {
       const { content: currentContent, revision: currentRevision } = await this.readFileState(op.path);
 
       if (currentRevision !== op.baseRevision) {
+        const headRevision = await this.#git(['rev-parse', 'HEAD']);
         throw createConflictError({
           currentContent,
           currentRevision,
           error: 'conflict',
           expectedBaseRevision: op.baseRevision,
+          headRevision,
           path: op.path,
           serverMergeState: {
             conflictPaths: [],

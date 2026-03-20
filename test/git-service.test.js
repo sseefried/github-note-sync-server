@@ -115,6 +115,7 @@ test('applyOps applies patches, detects true duplicates, and surfaces revision c
       assert.equal(error.payload.error, 'conflict');
       assert.equal(error.payload.path, 'notes/today.md');
       assert.equal(error.payload.currentContent, 'first line\nsecond line\n');
+      assert.match(error.payload.headRevision, /^[0-9a-f]{40}$/);
       return true;
     },
   );
