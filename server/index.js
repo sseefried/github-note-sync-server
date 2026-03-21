@@ -449,7 +449,7 @@ app.post('/api/ops', async (request, response) => {
   }
 });
 
-app.post('/api/conflicts/commit-markers', async (request, response) => {
+app.post('/api/conflicts/merge', async (request, response) => {
   const manager = requireService(repoManager, response);
   const user = await requireAuthenticatedUser(request, response);
 
