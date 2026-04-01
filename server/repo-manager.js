@@ -348,7 +348,15 @@ export class RepoManager {
     const normalizedUserId = this.#normalizeUserId(userId);
     const normalizedAlias = this.#normalizeRepoAlias(repoAlias);
     const service = await this.#ensureServiceReady(normalizedUserId, normalizedAlias, 'read');
-    return service.readFileState(relativePath);
+    const [file, headRevision] = await Promise.all([
+      service.readFileState(relativePath),
+      service.getHeadRevision(),
+    ]);
+
+    return {
+      ...file,
+      headRevision,
+    };
   }
 
   async applyOps(userId, repoAlias, ops) {

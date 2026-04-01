@@ -196,6 +196,23 @@ export class GitRepoService {
       const { content: currentContent, revision: currentRevision } = await this.readFileState(op.path);
 
       if (currentRevision !== op.baseRevision) {
+        if (typeof op.targetContent === 'string' && currentContent === op.targetContent) {
+          await this.#recordAppliedOp(op.opId, {
+            path: op.path,
+            recordedAt: new Date().toISOString(),
+            revision: currentRevision,
+          });
+
+          ackedOpIds.push(op.opId);
+          outcomes.push({
+            opId: op.opId,
+            path: op.path,
+            revision: currentRevision,
+            status: 'duplicate',
+          });
+          continue;
+        }
+
         const headRevision = await this.#git(['rev-parse', 'HEAD']);
         throw createConflictError({
           currentContent,

@@ -91,6 +91,16 @@ test('applyOps applies patches, detects true duplicates, and surfaces revision c
   const duplicateResult = await service.applyOps([patchOp]);
   assert.equal(duplicateResult.outcomes[0].status, 'duplicate');
 
+  const convergedResult = await service.applyOps([
+    {
+      ...patchOp,
+      opId: 'op-1-converged',
+      targetContent: 'first line\nsecond line\n',
+    },
+  ]);
+  assert.equal(convergedResult.outcomes[0].status, 'duplicate');
+  assert.equal(await service.readFile('notes/today.md'), 'first line\nsecond line\n');
+
   await service.writeFile('notes/today.md', initialFileState.content);
 
   const replayedResult = await service.applyOps([patchOp]);
